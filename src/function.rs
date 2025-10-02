@@ -250,6 +250,9 @@ pub fn run_llm_function(
     cmd_args: Vec<String>,
     mut envs: HashMap<String, String>,
 ) -> Result<Option<String>> {
+    debug!("run_llm_function called with cmd_name: {}", cmd_name);
+    debug!("LLM_OUTPUT environment variable: {:?}", std::env::var("LLM_OUTPUT"));
+
     let prompt = format!("Call {cmd_name} {}", cmd_args.join(" "));
 
     let mut bin_dirs: Vec<PathBuf> = vec![];
@@ -268,27 +271,60 @@ pub fn run_llm_function(
         .join("");
     envs.insert("PATH".into(), format!("{prepend_path}{current_path}"));
 
-    let temp_file = temp_file("-eval-", "");
-    envs.insert("LLM_OUTPUT".into(), temp_file.display().to_string());
+    // Check if LLM_OUTPUT is already defined in the environment
+    let llm_output_defined = std::env::var("LLM_OUTPUT").is_ok();
+    
+    // Only create temp_file if LLM_OUTPUT isn't already defined
+    let temp_file = if !llm_output_defined {
+        let temp = temp_file("-eval-", "");
+        debug!("Creating temporary file for LLM_OUTPUT: {}", temp.display());
+        envs.insert("LLM_OUTPUT".into(), temp.display().to_string());
+        temp
+    } else {
+        // Use a placeholder PathBuf that won't be used
+        PathBuf::new()
+    };
 
     #[cfg(windows)]
     let cmd_name = polyfill_cmd_name(&cmd_name, &bin_dirs);
-    if *IS_STDOUT_TERMINAL {
+    
+    // Print if stdout is a terminal OR LLM_OUTPUT is defined
+    if *IS_STDOUT_TERMINAL || llm_output_defined {
         println!("{}", dimmed_text(&prompt));
+        debug!("Displaying tool call prompt (IS_STDOUT_TERMINAL: {}, llm_output_defined: {})", *IS_STDOUT_TERMINAL, llm_output_defined);
     }
-    let exit_code = run_command(&cmd_name, &cmd_args, Some(envs))
+    
+    let exit_code = run_command(&cmd_name, &cmd_args, Some(envs.clone()))
         .map_err(|err| anyhow!("Unable to run {cmd_name}, {err}"))?;
     if exit_code != 0 {
         bail!("Tool call exit with {exit_code}");
     }
+    
     let mut output = None;
-    if temp_file.exists() {
+    
+    if llm_output_defined {
+        // If LLM_OUTPUT was predefined, get the value directly from environment
+        debug!("Using predefined LLM_OUTPUT environment variable");
+        if let Ok(llm_path) = std::env::var("LLM_OUTPUT") {
+            let path = Path::new(&llm_path);
+            if path.exists() {
+                let contents = fs::read_to_string(path).context("Failed to retrieve tool call output")?;
+                if !contents.is_empty() {
+                    output = Some(contents);
+                }
+            }
+        }
+    } else if temp_file.exists() {
+        // Use the temporary file we created
+        debug!("Reading tool output from temporary file: {}", temp_file.display());
         let contents =
             fs::read_to_string(temp_file).context("Failed to retrieve tool call output")?;
         if !contents.is_empty() {
             output = Some(contents);
         }
-    };
+    }
+    debug!("Tool output: {}", output.is_some());
+    
     Ok(output)
 }
 
