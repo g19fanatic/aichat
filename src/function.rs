@@ -3,6 +3,7 @@ use crate::{
     utils::*,
 };
 
+use jsonic;
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -179,9 +180,26 @@ impl ToolCall {
         let json_data = if self.arguments.is_object() {
             self.arguments.clone()
         } else if let Some(arguments) = self.arguments.as_str() {
-            let arguments: Value = serde_json::from_str(arguments).map_err(|_| {
-                anyhow!("The call '{call_name}' has invalid arguments: {arguments}")
-            })?;
+            // Using jsonic for fuzzy JSON parsing first
+            let arguments: Value = match jsonic::parse(arguments) {
+                Ok(json_item) => {
+                    // Convert JsonItem to string and then to Value
+                    let json_str = json_item.as_str().unwrap_or_default();
+                    serde_json::from_str(json_str).map_err(|err| {
+                        anyhow!(
+                            "The call '{call_name}' has invalid arguments: {arguments}. Error: {err}"
+                        )
+                    })?
+                },
+                Err(_) => {
+                    // Fallback to strict parsing with better error message
+                    serde_json::from_str(arguments).map_err(|err| {
+                        anyhow!(
+                            "The call '{call_name}' has invalid arguments: {arguments}. Error: {err}"
+                        )
+                    })?
+                }
+            };
             arguments
         } else {
             bail!(
@@ -290,7 +308,7 @@ pub fn run_llm_function(
     
     // Print if stdout is a terminal OR LLM_OUTPUT is defined
     if *IS_STDOUT_TERMINAL || llm_output_defined {
-        println!("{}", dimmed_text(&prompt));
+        println!("**~~ {} ~~**", dimmed_text(&prompt));
         debug!("Displaying tool call prompt (IS_STDOUT_TERMINAL: {}, llm_output_defined: {})", *IS_STDOUT_TERMINAL, llm_output_defined);
     }
     

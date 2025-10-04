@@ -72,6 +72,7 @@ dependencies = [
  "inquire",
  "is-terminal",
  "json-patch",
+ "jsonic",
  "log",
  "nu-ansi-term 0.50.1",
  "os_info",
@@ -1691,6 +1692,12 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "jsonic"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1b8306061986118bb65f0fd66c3e2ba9db18e8c1bf0cc78a17e9aa3a6d5d8c7"
 
 [[package]]
 name = "jsonptr"
