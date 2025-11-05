@@ -71,7 +71,16 @@ impl Functions {
                 )
             };
             let content = fs::read_to_string(declarations_path).with_context(ctx)?;
-            serde_json::from_str(&content).with_context(ctx)?
+            // Use jsonic to handle potentially malformed JSON in declarations file
+            match jsonic::parse(&content) {
+                Ok(json_item) => {
+                    let json_str = json_item.as_str().unwrap_or_default();
+                    serde_json::from_str(json_str).with_context(ctx)?
+                },
+                Err(err) => {
+                    bail!("Failed to parse function declarations: {}", err);
+                }
+            }
         } else {
             vec![]
         };
@@ -187,17 +196,13 @@ impl ToolCall {
                     let json_str = json_item.as_str().unwrap_or_default();
                     serde_json::from_str(json_str).map_err(|err| {
                         anyhow!(
-                            "The call '{call_name}' has invalid arguments: {arguments}. Error: {err}"
+                            "The call '{call_name}' has invalid arguments: {arguments}. Error parsing valid JSON structure: {err}"
                         )
                     })?
                 },
-                Err(_) => {
-                    // Fallback to strict parsing with better error message
-                    serde_json::from_str(arguments).map_err(|err| {
-                        anyhow!(
-                            "The call '{call_name}' has invalid arguments: {arguments}. Error: {err}"
-                        )
-                    })?
+                Err(err) => {
+                    // More specific error for jsonic parsing failure
+                    bail!("The call '{call_name}' has malformed JSON arguments: {arguments}. Error: {err}")
                 }
             };
             arguments
@@ -338,7 +343,19 @@ pub fn run_llm_function(
         let contents =
             fs::read_to_string(temp_file).context("Failed to retrieve tool call output")?;
         if !contents.is_empty() {
-            output = Some(contents);
+            // Try to parse as JSON with jsonic if the content appears to be JSON
+            if contents.trim().starts_with('{') || contents.trim().starts_with('[') {
+                match jsonic::parse(&contents) {
+                    Ok(json_item) => {
+                        output = Some(json_item.as_str().unwrap_or(&contents).to_string());
+                    },
+                    Err(_) => {
+                        output = Some(contents);
+                    }
+                }
+            } else {
+                output = Some(contents);
+            }
         }
     }
     debug!("Tool output: {}", output.is_some());
