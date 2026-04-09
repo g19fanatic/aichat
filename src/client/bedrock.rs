@@ -43,10 +43,13 @@ impl BedrockClient {
         client: &ReqwestClient,
         data: ChatCompletionsData,
     ) -> Result<RequestBuilder> {
-        let access_key_id = self.get_access_key_id()?;
-        let secret_access_key = self.get_secret_access_key()?;
+        let (access_key_id, secret_access_key, session_token) =
+            fetch_bedrock_creds_from_cli().unwrap_or_else(|| (
+                self.get_access_key_id().unwrap_or_default(),
+                self.get_secret_access_key().unwrap_or_default(),
+                self.get_session_token().ok(),
+            ));
         let region = self.get_region()?;
-        let session_token = self.get_session_token().ok();
         let host = format!("bedrock-runtime.{region}.amazonaws.com");
 
         let model_name = &self.model.real_name();
@@ -94,10 +97,13 @@ impl BedrockClient {
         client: &ReqwestClient,
         data: &EmbeddingsData,
     ) -> Result<RequestBuilder> {
-        let access_key_id = self.get_access_key_id()?;
-        let secret_access_key = self.get_secret_access_key()?;
+        let (access_key_id, secret_access_key, session_token) =
+            fetch_bedrock_creds_from_cli().unwrap_or_else(|| (
+                self.get_access_key_id().unwrap_or_default(),
+                self.get_secret_access_key().unwrap_or_default(),
+                self.get_session_token().ok(),
+            ));
         let region = self.get_region()?;
-        let session_token = self.get_session_token().ok();
         let host = format!("bedrock-runtime.{region}.amazonaws.com");
 
         let uri = format!("/model/{}/invoke", self.model.real_name());
@@ -141,6 +147,50 @@ impl BedrockClient {
 
         Ok(builder)
     }
+}
+
+/// Attempt to fetch fresh AWS credentials by calling `aws configure export-credentials`.
+/// Reads profile from BEDROCK_AWS_PROFILE env var (first) or AWS_PROFILE (fallback).
+/// Returns None if the aws CLI call fails or no profile env var is set — callers fall back
+/// to the standard config_get_fn chain (env vars / config file).
+fn fetch_bedrock_creds_from_cli() -> Option<(String, String, Option<String>)> {
+    let profile = std::env::var("BEDROCK_AWS_PROFILE")
+        .or_else(|_| std::env::var("AWS_PROFILE"))
+        .ok()?;
+
+    let output = std::process::Command::new("aws")
+        .args([
+            "configure",
+            "export-credentials",
+            "--profile",
+            &profile,
+            "--format",
+            "env-no-export",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut akid = None::<String>;
+    let mut sak = None::<String>;
+    let mut st = None::<String>;
+
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "AWS_ACCESS_KEY_ID"     => akid = Some(v.trim().to_string()),
+                "AWS_SECRET_ACCESS_KEY" => sak  = Some(v.trim().to_string()),
+                "AWS_SESSION_TOKEN"     => st   = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    Some((akid?, sak?, st))
 }
 
 #[async_trait::async_trait]
