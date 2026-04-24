@@ -282,11 +282,13 @@ impl Model {
     }
 
     pub fn guard_max_input_tokens(&self, messages: &[Message]) -> Result<()> {
+        let max_input_tokens = match self.data.max_input_tokens {
+            Some(v) => v,
+            None => return Ok(()),
+        };
         let total_tokens = self.total_tokens(messages) + BASIS_TOKENS;
-        if let Some(max_input_tokens) = self.data.max_input_tokens {
-            if total_tokens >= max_input_tokens {
-                bail!("Exceed max_input_tokens limit")
-            }
+        if total_tokens >= max_input_tokens {
+            bail!("Exceed max_input_tokens limit")
         }
         Ok(())
     }
@@ -403,5 +405,31 @@ where
     match value {
         Some(value) => value.to_string(),
         None => "-".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perf_q02_guard_skips_when_none() {
+        // Model with no max_input_tokens set (default is None)
+        let model = Model::new("test_client", "test_model");
+        assert!(model.max_input_tokens().is_none());
+
+        // guard_max_input_tokens should return Ok(()) without computing tokens
+        let result = model.guard_max_input_tokens(&[]);
+        assert!(result.is_ok(), "Expected Ok(()) when max_input_tokens is None");
+
+        // Also verify that when max_input_tokens IS set, guard enforces the limit
+        let mut model_with_limit = Model::new("test_client", "test_model");
+        model_with_limit.data.max_input_tokens = Some(10);
+        // Empty messages = 0 tokens + BASIS_TOKENS(2) = 2 < 10, should be Ok
+        let result = model_with_limit.guard_max_input_tokens(&[]);
+        assert!(result.is_ok(), "Expected Ok(()) when tokens are under the limit");
+
+        // Verify max_input_tokens is set
+        assert_eq!(model_with_limit.max_input_tokens(), Some(10));
     }
 }

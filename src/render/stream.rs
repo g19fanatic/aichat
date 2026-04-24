@@ -120,13 +120,13 @@ async fn markdown_stream_inner(
                     queue!(writer, terminal::Clear(terminal::ClearType::FromCursorDown))?;
 
                     if text.contains('\n') {
-                        let text = format!("{buffer}{text}");
-                        let (head, tail) = split_line_tail(&text);
+                        buffer.push_str(&text);
+                        let (head, tail) = split_line_tail(&buffer);
                         let output = render.render(head);
                         print_block(writer, &output, columns)?;
                         buffer = tail.to_string();
                     } else {
-                        buffer = format!("{buffer}{text}");
+                        buffer.push_str(&text);
                     }
 
                     let output = render.render_line(&buffer);
@@ -214,4 +214,43 @@ fn split_line_tail(text: &str) -> (&str, &str) {
 fn need_rows(text: &str, columns: u16) -> u16 {
     let buffer_width = display_width(text).max(1) as u16;
     buffer_width.div_ceil(columns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perf_q10_buffer_append_equivalent() {
+        // Verify push_str produces identical results to format!("{buffer}{text}")
+        let cases: Vec<(&str, &str)> = vec![
+            ("", "hello"),
+            ("hello", " world"),
+            ("line1\n", "line2"),
+            ("buffer content", "\nnew line\nand more"),
+            ("", ""),
+            ("existing", ""),
+            ("abc", "def\nghi\njkl"),
+            ("prefix ", "suffix\n"),
+        ];
+
+        for (buf, text) in &cases {
+            // Old approach: format!
+            let format_result = format!("{buf}{text}");
+
+            // New approach: push_str
+            let mut push_result = buf.to_string();
+            push_result.push_str(text);
+
+            assert_eq!(
+                format_result, push_result,
+                "Mismatch for buffer={buf:?}, text={text:?}"
+            );
+
+            // Verify split_line_tail produces same results on both
+            let (fh, ft) = split_line_tail(&format_result);
+            let (ph, pt) = split_line_tail(&push_result);
+            assert_eq!((fh, ft), (ph, pt), "split_line_tail mismatch for buffer={buf:?}, text={text:?}");
+        }
+    }
 }

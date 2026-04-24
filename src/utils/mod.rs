@@ -71,9 +71,8 @@ pub fn parse_bool(value: &str) -> Option<bool> {
 }
 
 pub fn estimate_token_length(text: &str) -> usize {
-    let words: Vec<&str> = text.unicode_words().collect();
     let mut output: f32 = 0.0;
-    for word in words {
+    for word in text.unicode_words() {
         if word.is_ascii() {
             output += 1.3;
         } else {
@@ -245,5 +244,26 @@ mod tests {
         );
         assert!(safe_join_path("C:\\Users\\user\\dir1", "/files/file1").is_none());
         assert!(safe_join_path("C:\\Users\\user\\dir1", "../file1").is_none());
+    }
+
+    #[test]
+    fn perf_q09_estimate_token_length_unchanged() {
+        // Characterization test: locks down existing behavior before refactoring
+        // estimate_token_length to remove unnecessary Vec collect.
+        assert_eq!(estimate_token_length(""), 0);
+        assert_eq!(estimate_token_length("hello"), 2); // 1 word * 1.3 = 1.3 -> ceil = 2
+        assert_eq!(estimate_token_length("hello world"), 3); // 2 * 1.3 = 2.6 -> ceil = 3
+        assert_eq!(estimate_token_length("a b c"), 4); // 3 * 1.3 = 3.9 -> ceil = 4
+        assert_eq!(estimate_token_length("one two three four five"), 7); // 5 * 1.3 = 6.5 -> ceil = 7
+        assert_eq!(estimate_token_length("test"), 2); // 1 * 1.3 = 1.3 -> ceil = 2
+    }
+
+    #[test]
+    fn perf_q08_reqwest_http2_enabled() {
+        // Compile-time proof that reqwest has "http2" feature enabled.
+        // `http2_prior_knowledge()` only exists with the "http2" cargo feature.
+        // If the feature is missing, this test will fail to compile.
+        let _builder = reqwest::ClientBuilder::new().http2_prior_knowledge();
+        assert!(format!("{:?}", _builder).contains("Client"));
     }
 }

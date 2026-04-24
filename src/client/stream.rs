@@ -233,6 +233,15 @@ impl JsonStreamParser {
             }
         }
         self.cursor = self.buffer.len();
+        // Drain processed prefix to bound memory growth
+        let drain_end = self.start.unwrap_or(self.buffer.len());
+        if drain_end > 0 {
+            self.buffer.drain(..drain_end);
+            if let Some(ref mut s) = self.start {
+                *s = 0;
+            }
+            self.cursor = self.buffer.len();
+        }
         Ok(())
     }
 }
@@ -292,5 +301,31 @@ mod tests {
 {"key": "value2"}
 {"key": "value3"}"#;
         assert_json_stream!(input, output);
+    }
+
+    #[test]
+    fn perf_q11_parser_buffer_bounded() {
+        let mut parser = JsonStreamParser::default();
+        let mut results = vec![];
+        let json_obj = r#"{"key": "value"}"#;
+
+        // Feed 100 complete JSON objects one at a time
+        for _ in 0..100 {
+            parser
+                .process(json_obj, &mut |data: &str| {
+                    results.push(data.to_string());
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert_eq!(results.len(), 100, "All 100 JSON objects should be parsed");
+        // Buffer should be bounded (drained after each extraction), not 100 * len
+        assert!(
+            parser.buffer.len() < json_obj.len() * 2,
+            "Buffer should be bounded after draining, got {} chars (expected < {})",
+            parser.buffer.len(),
+            json_obj.len() * 2
+        );
     }
 }

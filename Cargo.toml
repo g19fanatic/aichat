@@ -72,7 +72,7 @@ duct = "1.0.0"
 
 [dependencies.reqwest]
 version = "0.12.0"
-features = ["json", "multipart", "socks", "rustls-tls", "rustls-tls-native-roots"]
+features = ["json", "multipart", "socks", "rustls-tls", "rustls-tls-native-roots", "http2"]
 default-features = false
 
 [dependencies.syntect]

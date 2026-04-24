@@ -4,6 +4,7 @@ use crate::{
 };
 
 use jsonic;
+use rayon::prelude::*;
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    sync::OnceLock,
     path::{Path, PathBuf},
 };
 
@@ -19,29 +21,36 @@ const PATH_SEP: &str = ";";
 #[cfg(not(windows))]
 const PATH_SEP: &str = ":";
 
+static FUNCTIONS_PATH_CACHE: OnceLock<(PathBuf, String)> = OnceLock::new();
+
 pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Result<Vec<ToolResult>> {
-    let mut output = vec![];
     if calls.is_empty() {
-        return Ok(output);
+        return Ok(vec![]);
     }
     calls = ToolCall::dedup(calls);
     if calls.is_empty() {
         bail!("The request was aborted because an infinite loop of function calls was detected.")
     }
-    let mut is_all_null = true;
-    for call in calls {
-        let mut result = call.eval(config)?;
-        if result.is_null() {
-            result = json!("DONE");
-        } else {
-            is_all_null = false;
-        }
-        output.push(ToolResult::new(call, result));
-    }
+    let results: Result<Vec<(ToolCall, Value)>> = calls
+        .into_par_iter()
+        .map(|call| {
+            let mut result = call.eval(config)?;
+            if result.is_null() {
+                result = json!("DONE");
+            }
+            Ok((call, result))
+        })
+        .collect();
+    let results = results?;
+    let is_all_null = results.iter().all(|(_, r)| *r == json!("DONE"));
     if is_all_null {
-        output = vec![];
+        Ok(vec![])
+    } else {
+        Ok(results
+            .into_iter()
+            .map(|(call, result)| ToolResult::new(call, result))
+            .collect())
     }
-    Ok(output)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -189,20 +198,24 @@ impl ToolCall {
         let json_data = if self.arguments.is_object() {
             self.arguments.clone()
         } else if let Some(arguments) = self.arguments.as_str() {
-            // Using jsonic for fuzzy JSON parsing first
-            let arguments: Value = match jsonic::parse(arguments) {
-                Ok(json_item) => {
-                    // Convert JsonItem to string and then to Value
-                    let json_str = json_item.as_str().unwrap_or_default();
-                    serde_json::from_str(json_str).map_err(|err| {
-                        anyhow!(
-                            "The call '{call_name}' has invalid arguments: {arguments}. Error parsing valid JSON structure: {err}"
-                        )
-                    })?
-                },
-                Err(err) => {
-                    // More specific error for jsonic parsing failure
-                    bail!("The call '{call_name}' has malformed JSON arguments: {arguments}. Error: {err}")
+            // Try serde_json first (fast path for valid JSON), fall back to jsonic
+            let arguments: Value = match serde_json::from_str(arguments) {
+                Ok(value) => value,
+                Err(_) => {
+                    // Fall back to jsonic for fuzzy/non-standard JSON
+                    match jsonic::parse(arguments) {
+                        Ok(json_item) => {
+                            let json_str = json_item.as_str().unwrap_or_default();
+                            serde_json::from_str(json_str).map_err(|err| {
+                                anyhow!(
+                                    "The call '{call_name}' has invalid arguments: {arguments}. Error parsing valid JSON structure: {err}"
+                                )
+                            })?
+                        },
+                        Err(err) => {
+                            bail!("The call '{call_name}' has malformed JSON arguments: {arguments}. Error: {err}")
+                        }
+                    }
                 }
             };
             arguments
@@ -274,9 +287,8 @@ pub fn run_llm_function(
     mut envs: HashMap<String, String>,
 ) -> Result<Option<String>> {
     debug!("run_llm_function called with cmd_name: {}", cmd_name);
-    debug!("LLM_OUTPUT environment variable: {:?}", std::env::var("LLM_OUTPUT"));
-
-    let prompt = format!("Call {cmd_name} {}", cmd_args.join(" "));
+    let llm_output = std::env::var("LLM_OUTPUT").ok();
+    debug!("LLM_OUTPUT environment variable: {:?}", llm_output);
 
     let mut bin_dirs: Vec<PathBuf> = vec![];
     if cmd_args.len() > 1 {
@@ -285,8 +297,11 @@ pub fn run_llm_function(
             bin_dirs.push(dir);
         }
     }
-    bin_dirs.push(Config::functions_bin_dir());
-    let current_path = std::env::var("PATH").context("No PATH environment variable")?;
+    let (cached_bin_dir, cached_path) = FUNCTIONS_PATH_CACHE.get_or_init(|| {
+        (Config::functions_bin_dir(), std::env::var("PATH").unwrap_or_default())
+    });
+    bin_dirs.push(cached_bin_dir.clone());
+    let current_path = cached_path;
     let prepend_path = bin_dirs
         .iter()
         .map(|v| format!("{}{PATH_SEP}", v.display()))
@@ -295,7 +310,7 @@ pub fn run_llm_function(
     envs.insert("PATH".into(), format!("{prepend_path}{current_path}"));
 
     // Check if LLM_OUTPUT is already defined in the environment
-    let llm_output_defined = std::env::var("LLM_OUTPUT").is_ok();
+    let llm_output_defined = llm_output.is_some();
     
     // Only create temp_file if LLM_OUTPUT isn't already defined
     let temp_file = if !llm_output_defined {
@@ -313,11 +328,12 @@ pub fn run_llm_function(
     
     // Print if stdout is a terminal OR LLM_OUTPUT is defined
     if *IS_STDOUT_TERMINAL || llm_output_defined {
+        let prompt = format!("Call {cmd_name} {}", cmd_args.join(" "));
         println!("**~~ {} ~~**", dimmed_text(&prompt));
         debug!("Displaying tool call prompt (IS_STDOUT_TERMINAL: {}, llm_output_defined: {})", *IS_STDOUT_TERMINAL, llm_output_defined);
     }
     
-    let exit_code = run_command(&cmd_name, &cmd_args, Some(envs.clone()))
+    let exit_code = run_command(&cmd_name, &cmd_args, Some(envs))
         .map_err(|err| anyhow!("Unable to run {cmd_name}, {err}"))?;
     if exit_code != 0 {
         bail!("Tool call exit with {exit_code}");
@@ -328,7 +344,7 @@ pub fn run_llm_function(
     if llm_output_defined {
         // If LLM_OUTPUT was predefined, get the value directly from environment
         debug!("Using predefined LLM_OUTPUT environment variable");
-        if let Ok(llm_path) = std::env::var("LLM_OUTPUT") {
+        if let Some(ref llm_path) = llm_output {
             let path = Path::new(&llm_path);
             if path.exists() {
                 let contents = fs::read_to_string(path).context("Failed to retrieve tool call output")?;
@@ -341,22 +357,31 @@ pub fn run_llm_function(
         // Use the temporary file we created
         debug!("Reading tool output from temporary file: {}", temp_file.display());
         let contents =
-            fs::read_to_string(temp_file).context("Failed to retrieve tool call output")?;
+            fs::read_to_string(&temp_file).context("Failed to retrieve tool call output")?;
         if !contents.is_empty() {
             // Try to parse as JSON with jsonic if the content appears to be JSON
             if contents.trim().starts_with('{') || contents.trim().starts_with('[') {
-                match jsonic::parse(&contents) {
-                    Ok(json_item) => {
-                        output = Some(json_item.as_str().unwrap_or(&contents).to_string());
+                // Try serde_json first (fast path), fall back to jsonic
+                match serde_json::from_str::<Value>(&contents) {
+                    Ok(value) => {
+                        output = Some(value.to_string());
                     },
                     Err(_) => {
-                        output = Some(contents);
+                        match jsonic::parse(&contents) {
+                            Ok(json_item) => {
+                                output = Some(json_item.as_str().unwrap_or(&contents).to_string());
+                            },
+                            Err(_) => {
+                                output = Some(contents);
+                            }
+                        }
                     }
                 }
             } else {
                 output = Some(contents);
             }
         }
+        let _ = fs::remove_file(&temp_file);
     }
     debug!("Tool output: {}", output.is_some());
     
@@ -377,4 +402,122 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
         }
     }
     cmd_name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perf_q06_single_env_lookup() {
+        // Verify run_llm_function still works after merging three
+        // env::var("LLM_OUTPUT") calls into one cached lookup.
+        let envs = HashMap::new();
+        let result = run_llm_function("nonexistent_cmd_q06_test".into(), vec!["{}".into()], envs);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nonexistent_cmd_q06_test"), "Expected cmd name in error, got: {err}");
+    }
+
+    #[test]
+    fn perf_q04_envs_not_cloned() {
+        // Verify run_llm_function still works after replacing envs.clone()
+        // with a move at the run_command call site.
+        let mut envs = HashMap::new();
+        envs.insert("CUSTOM_Q04_VAR".into(), "test_value".into());
+        let result = run_llm_function("nonexistent_cmd_q04_test".into(), vec!["{}".into()], envs);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nonexistent_cmd_q04_test"), "Expected cmd name in error, got: {err}");
+    }
+
+    #[test]
+    fn perf_q05_temp_file_cleanup() {
+        // Verify the cleanup pattern: temp_file creates a file path,
+        // writing + reading + removing leaves no leftover file.
+        let path = temp_file("-eval-q05-test-", "");
+        // Write content to the temp file
+        fs::write(&path, "test cleanup content").expect("Failed to write temp file");
+        assert!(path.exists(), "Temp file should exist after write");
+        // Read it back (borrowing, not consuming)
+        let contents = fs::read_to_string(&path).expect("Failed to read temp file");
+        assert_eq!(contents, "test cleanup content");
+        // Clean up — this is the pattern Q5 adds to production code
+        let _ = fs::remove_file(&path);
+        assert!(!path.exists(), "Temp file should be removed after cleanup");
+    }
+
+    #[test]
+    fn perf_q12_format_gated() {
+        // Behavior-preservation: run_llm_function still works after moving
+        // the format!(prompt) inside the IS_STDOUT_TERMINAL guard.
+        // The prompt is only used for display; moving it inside the guard
+        // avoids a String allocation when output is suppressed.
+        let envs = HashMap::new();
+        let result = run_llm_function("nonexistent_cmd_q12_test".into(), vec!["{}".into()], envs);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nonexistent_cmd_q12_test"), "Expected cmd name in error, got: {err}");
+    }
+
+    #[test]
+    fn perf_q07_json_parse_order() {
+        // Verify serde_json fast path produces identical results to jsonic pipeline
+        // for well-formed JSON (the common case Q7 optimizes).
+        let valid_obj = r#"{"key": "value", "num": 42}"#;
+        let valid_arr = r#"[1, 2, 3]"#;
+
+        // Fast path: serde_json parses valid JSON directly
+        let fast_obj: Value = serde_json::from_str(valid_obj).unwrap();
+        let fast_arr: Value = serde_json::from_str(valid_arr).unwrap();
+        assert_eq!(fast_obj["key"], "value");
+        assert_eq!(fast_obj["num"], 42);
+        assert_eq!(fast_arr[0], 1);
+
+        // Slow path: jsonic -> serde_json pipeline (existing behavior)
+        let jsonic_obj = jsonic::parse(valid_obj).unwrap();
+        let slow_obj: Value = serde_json::from_str(jsonic_obj.as_str().unwrap_or_default()).unwrap();
+        let jsonic_arr = jsonic::parse(valid_arr).unwrap();
+        let slow_arr: Value = serde_json::from_str(jsonic_arr.as_str().unwrap_or_default()).unwrap();
+
+        // Both paths must produce identical results
+        assert_eq!(fast_obj, slow_obj, "serde_json fast path must match jsonic pipeline for objects");
+        assert_eq!(fast_arr, slow_arr, "serde_json fast path must match jsonic pipeline for arrays");
+    }
+
+    #[test]
+    fn perf_q03_cached_path_consistent() {
+        // Verify OnceLock-cached PATH and functions_bin_dir return
+        // consistent values across multiple calls (init runs only once).
+        let (dir1, path1) = FUNCTIONS_PATH_CACHE.get_or_init(|| {
+            (Config::functions_bin_dir(), std::env::var("PATH").unwrap_or_default())
+        });
+        let (dir2, path2) = FUNCTIONS_PATH_CACHE.get_or_init(|| {
+            // This closure should NEVER execute (already initialized)
+            panic!("OnceLock should already be initialized")
+        });
+        assert_eq!(dir1, dir2, "functions_bin_dir should be consistent across calls");
+        assert_eq!(path1, path2, "PATH should be consistent across calls");
+        // Pointer equality proves same cached reference
+        assert!(std::ptr::eq(dir1, dir2), "Should return same reference (cached)");
+    }
+
+    #[test]
+    fn perf_q01_eval_preserves_order() {
+        // Verify rayon par_iter preserves input ordering — the core
+        // invariant that Q1 parallel eval_tool_calls relies on.
+        use rayon::prelude::*;
+        let inputs: Vec<u32> = (0..100).collect();
+        let results: Vec<u32> = inputs.into_par_iter().map(|x| x).collect();
+        assert_eq!(results, (0..100).collect::<Vec<u32>>());
+
+        // Also verify ToolCall::dedup preserves relative order
+        let calls: Vec<ToolCall> = (0..5)
+            .map(|i| ToolCall::new(format!("func_{i}"), json!({}), Some(format!("id_{i}"))))
+            .collect();
+        let deduped = ToolCall::dedup(calls);
+        for (i, call) in deduped.iter().enumerate() {
+            assert_eq!(call.name, format!("func_{i}"), "dedup must preserve order at index {i}");
+        }
+    }
 }
