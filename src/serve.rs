@@ -20,6 +20,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
+        Mutex,
     },
 };
 use tokio::{
@@ -344,6 +345,9 @@ impl Server {
                                 let _ = tx.send(ResEvent::Done);
                                 sse_rx.close();
                             }
+                            SseEvent::Usage(i, o) => {
+                                let _ = tx.send(ResEvent::Usage(i, o));
+                            }
                         }
                     }
                 }
@@ -361,13 +365,20 @@ impl Server {
                         match ret {
                             Ok(output) => {
                                 let ChatCompletionsOutput {
-                                    text, tool_calls, ..
+                                    text,
+                                    tool_calls,
+                                    input_tokens,
+                                    output_tokens,
+                                    ..
                                 } = output;
                                 let _ = tx.send(ResEvent::First(None));
                                 is_first.store(false, Ordering::SeqCst);
                                 let _ = tx.send(ResEvent::Text(text));
                                 if !tool_calls.is_empty() {
                                     let _ = tx.send(ResEvent::ToolCalls(tool_calls));
+                                }
+                                if let (Some(i), Some(o)) = (input_tokens, output_tokens) {
+                                    let _ = tx.send(ResEvent::Usage(i, o));
                                 }
                             }
                             Err(err) => {
@@ -413,13 +424,13 @@ impl Server {
                 bail!("{err}");
             }
 
-            let shared: Arc<(String, String, i64, AtomicBool)> =
-                Arc::new((completion_id, model_name, created, AtomicBool::new(false)));
+            let shared: Arc<(String, String, i64, AtomicBool, Mutex<Option<(u64, u64)>>)> =
+                Arc::new((completion_id, model_name, created, AtomicBool::new(false), Mutex::new(None)));
             let stream = UnboundedReceiverStream::new(rx);
             let stream = stream.filter_map(move |res_event| {
                 let shared = shared.clone();
                 async move {
-                    let (completion_id, model, created, has_tool_calls) = shared.as_ref();
+                    let (completion_id, model, created, has_tool_calls, usage_store) = shared.as_ref();
                     match res_event {
                         ResEvent::Text(text) => {
                             Some(Ok(create_text_frame(completion_id, model, *created, &text)))
@@ -438,7 +449,12 @@ impl Server {
                             model,
                             *created,
                             has_tool_calls.load(Ordering::SeqCst),
+                            usage_store.lock().unwrap().take(),
                         ))),
+                        ResEvent::Usage(in_tok, out_tok) => {
+                            *usage_store.lock().unwrap() = Some((in_tok, out_tok));
+                            None
+                        }
                         _ => None,
                     }
                 }
@@ -621,6 +637,7 @@ enum ResEvent {
     Text(String),
     ToolCalls(Vec<ToolCall>),
     Done,
+    Usage(u64, u64),
 }
 
 async fn shutdown_signal() {
@@ -718,7 +735,7 @@ fn create_tool_calls_frame(
     Frame::data(Bytes::from(chunks))
 }
 
-fn create_done_frame(id: &str, model: &str, created: i64, has_tool_calls: bool) -> Frame<Bytes> {
+fn create_done_frame(id: &str, model: &str, created: i64, has_tool_calls: bool, usage: Option<(u64, u64)>) -> Frame<Bytes> {
     let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
     let choice = json!({
         "index": 0,
@@ -726,7 +743,25 @@ fn create_done_frame(id: &str, model: &str, created: i64, has_tool_calls: bool) 
         "finish_reason": finish_reason,
     });
     let value = build_chat_completion_chunk_json(id, model, created, &choice);
-    Frame::data(Bytes::from(format!("data: {value}\n\ndata: [DONE]\n\n")))
+    let mut chunks = format!("data: {value}\n\n");
+    if let Some((prompt_tokens, completion_tokens)) = usage {
+        let total_tokens = prompt_tokens + completion_tokens;
+        let usage_value = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            },
+        });
+        chunks.push_str(&format!("data: {usage_value}\n\n"));
+    }
+    chunks.push_str("data: [DONE]\n\n");
+    Frame::data(Bytes::from(chunks))
 }
 
 fn build_chat_completion_chunk_json(id: &str, model: &str, created: i64, choice: &Value) -> Value {

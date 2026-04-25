@@ -1104,6 +1104,7 @@ impl Config {
                     input,
                     output,
                     continuous,
+                    ..
                 }) = &self.last_message
                 {
                     if (*continuous && !output.is_empty())
@@ -1115,7 +1116,7 @@ impl Config {
                         .with_default(false)
                         .prompt()?;
                         if ans {
-                            session.add_message(input, output)?;
+                            session.add_message(input, output, None, None)?;
                         }
                     }
                 }
@@ -2013,6 +2014,15 @@ impl Config {
             output.insert("consume_tokens", tokens.to_string());
             output.insert("consume_percent", percent.to_string());
             output.insert("user_messages_len", session.user_messages_len().to_string());
+            if let Some(api_in) = session.api_input_tokens() {
+                output.insert("api_input_tokens", api_in.to_string());
+            }
+            if let Some(api_out) = session.api_output_tokens() {
+                output.insert("api_output_tokens", api_out.to_string());
+            }
+            if let (Some(api_in), Some(api_out)) = (session.api_input_tokens(), session.api_output_tokens()) {
+                output.insert("api_total_tokens", (api_in + api_out).to_string());
+            }
         }
         if let Some(rag) = &self.rag {
             output.insert("rag", rag.name().to_string());
@@ -2047,7 +2057,7 @@ impl Config {
     }
 
     pub fn before_chat_completion(&mut self, input: &Input) -> Result<()> {
-        self.last_message = Some(LastMessage::new(input.clone(), String::new()));
+        self.last_message = Some(LastMessage::new(input.clone(), String::new(), None, None));
         Ok(())
     }
 
@@ -2056,13 +2066,15 @@ impl Config {
         input: &Input,
         output: &str,
         tool_results: &[ToolResult],
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
     ) -> Result<()> {
         if !tool_results.is_empty() {
             return Ok(());
         }
-        self.last_message = Some(LastMessage::new(input.clone(), output.to_string()));
+        self.last_message = Some(LastMessage::new(input.clone(), output.to_string(), input_tokens, output_tokens));
         if !self.dry_run {
-            self.save_message(input, output)?;
+            self.save_message(input, output, input_tokens, output_tokens)?;
         }
         Ok(())
     }
@@ -2073,11 +2085,11 @@ impl Config {
         }
     }
 
-    fn save_message(&mut self, input: &Input, output: &str) -> Result<()> {
+    fn save_message(&mut self, input: &Input, output: &str, input_tokens: Option<u64>, output_tokens: Option<u64>) -> Result<()> {
         let mut input = input.clone();
         input.clear_patch();
         if let Some(session) = input.session_mut(&mut self.session) {
-            session.add_message(&input, output)?;
+            session.add_message(&input, output, input_tokens, output_tokens)?;
             return Ok(());
         }
 
@@ -2568,14 +2580,18 @@ pub struct LastMessage {
     pub input: Input,
     pub output: String,
     pub continuous: bool,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 impl LastMessage {
-    pub fn new(input: Input, output: String) -> Self {
+    pub fn new(input: Input, output: String, input_tokens: Option<u64>, output_tokens: Option<u64>) -> Self {
         Self {
             input,
             output,
             continuous: true,
+            input_tokens,
+            output_tokens,
         }
     }
 }

@@ -81,6 +81,7 @@ pub async fn claude_chat_completions_streaming(
     let mut function_arguments = String::new();
     let mut function_id = String::new();
     let mut reasoning_state = 0;
+    let mut claude_input_tokens: Option<u64> = None;
     let handle = |message: SseMmessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
@@ -142,6 +143,14 @@ pub async fn claude_chat_completions_streaming(
                             arguments,
                             Some(function_id.clone()),
                         ))?;
+                    }
+                }
+                "message_start" => {
+                    claude_input_tokens = data["message"]["usage"]["input_tokens"].as_u64();
+                }
+                "message_delta" => {
+                    if let (Some(input), Some(output)) = (claude_input_tokens, data["usage"]["output_tokens"].as_u64()) {
+                        handler.set_usage(input, output);
                     }
                 }
                 _ => {}

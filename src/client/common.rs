@@ -305,6 +305,14 @@ impl ChatCompletionsOutput {
 }
 
 #[derive(Debug)]
+pub struct ChatCompletionsResult {
+    pub text: String,
+    pub tool_results: Vec<ToolResult>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+#[derive(Debug)]
 pub struct EmbeddingsData {
     pub texts: Vec<String>,
     pub query: bool,
@@ -409,7 +417,7 @@ pub async fn call_chat_completions(
     extract_code: bool,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
+) -> Result<ChatCompletionsResult> {
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         "Generating",
@@ -422,6 +430,8 @@ pub async fn call_chat_completions(
             let ChatCompletionsOutput {
                 mut text,
                 tool_calls,
+                input_tokens,
+                output_tokens,
                 ..
             } = ret;
             if !text.is_empty() {
@@ -432,7 +442,12 @@ pub async fn call_chat_completions(
                     client.global_config().read().print_markdown(&text)?;
                 }
             }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
+            Ok(ChatCompletionsResult {
+                text,
+                tool_results: eval_tool_calls(client.global_config(), tool_calls)?,
+                input_tokens,
+                output_tokens,
+            })
         }
         Err(err) => Err(err),
     }
@@ -442,7 +457,7 @@ pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
+) -> Result<ChatCompletionsResult> {
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
 
@@ -457,13 +472,18 @@ pub async fn call_chat_completions_streaming(
 
     render_ret?;
 
-    let (text, tool_calls) = handler.take();
+    let (text, tool_calls, input_tokens, output_tokens) = handler.take();
     match send_ret {
         Ok(_) => {
             if !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
+            Ok(ChatCompletionsResult {
+                text,
+                tool_results: eval_tool_calls(client.global_config(), tool_calls)?,
+                input_tokens,
+                output_tokens,
+            })
         }
         Err(err) => {
             if !text.is_empty() {
@@ -673,4 +693,49 @@ fn prompt_input_string(
     }
     let text = text.prompt()?;
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_completions_result_with_tokens() {
+        let result = ChatCompletionsResult {
+            text: "Hello world".to_string(),
+            tool_results: vec![],
+            input_tokens: Some(10),
+            output_tokens: Some(25),
+        };
+        assert_eq!(result.text, "Hello world");
+        assert!(result.tool_results.is_empty());
+        assert_eq!(result.input_tokens, Some(10));
+        assert_eq!(result.output_tokens, Some(25));
+    }
+
+    #[test]
+    fn test_chat_completions_result_without_tokens() {
+        let result = ChatCompletionsResult {
+            text: "Response".to_string(),
+            tool_results: vec![],
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert_eq!(result.input_tokens, None);
+        assert_eq!(result.output_tokens, None);
+    }
+
+    #[test]
+    fn test_chat_completions_result_default() {
+        let result = ChatCompletionsResult {
+            text: String::new(),
+            tool_results: vec![],
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert!(result.text.is_empty());
+        assert!(result.tool_results.is_empty());
+        assert_eq!(result.input_tokens, None);
+        assert_eq!(result.output_tokens, None);
+    }
 }

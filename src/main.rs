@@ -14,7 +14,8 @@ extern crate log;
 
 use crate::cli::Cli;
 use crate::client::{
-    call_chat_completions, call_chat_completions_streaming, list_models, ModelType,
+    call_chat_completions, call_chat_completions_streaming, ChatCompletionsResult, list_models,
+    ModelType,
 };
 use crate::config::{
     ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
@@ -202,7 +203,7 @@ async fn start_directive(
     let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if !input.stream() || extract_code {
+    let ChatCompletionsResult { text: output, tool_results, input_tokens, output_tokens } = if !input.stream() || extract_code {
         call_chat_completions(
             &input,
             true,
@@ -216,7 +217,7 @@ async fn start_directive(
     };
     config
         .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
+        .after_chat_completion(&input, &output, &tool_results, input_tokens, output_tokens)?;
 
     if !tool_results.is_empty() {
         start_directive(
@@ -246,12 +247,12 @@ async fn shell_execute(
 ) -> Result<()> {
     let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
-    let (eval_str, _) =
+    let ChatCompletionsResult { text: eval_str, input_tokens, output_tokens, .. } =
         call_chat_completions(&input, false, true, client.as_ref(), abort_signal.clone()).await?;
 
     config
         .write()
-        .after_chat_completion(&input, &eval_str, &[])?;
+        .after_chat_completion(&input, &eval_str, &[], input_tokens, output_tokens)?;
     if eval_str.is_empty() {
         bail!("No command generated");
     }

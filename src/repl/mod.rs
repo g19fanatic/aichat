@@ -6,7 +6,7 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::{call_chat_completions, call_chat_completions_streaming};
+use crate::client::{call_chat_completions, call_chat_completions_streaming, ChatCompletionsResult};
 use crate::config::{
     macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage,
     StateFlags,
@@ -735,14 +735,14 @@ async fn ask(
 
     let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if input.stream() {
+    let ChatCompletionsResult { text: output, tool_results, input_tokens, output_tokens } = if input.stream() {
         call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
     } else {
         call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone()).await?
     };
     config
         .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
+        .after_chat_completion(&input, &output, &tool_results, input_tokens, output_tokens)?;
     if !tool_results.is_empty() {
         ask(
             config,

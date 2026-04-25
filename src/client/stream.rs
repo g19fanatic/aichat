@@ -13,6 +13,8 @@ pub struct SseHandler {
     abort_signal: AbortSignal,
     buffer: String,
     tool_calls: Vec<ToolCall>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 }
 
 impl SseHandler {
@@ -22,6 +24,8 @@ impl SseHandler {
             abort_signal,
             buffer: String::new(),
             tool_calls: Vec::new(),
+            input_tokens: None,
+            output_tokens: None,
         }
     }
 
@@ -69,11 +73,21 @@ impl SseHandler {
         &self.tool_calls
     }
 
-    pub fn take(self) -> (String, Vec<ToolCall>) {
+    pub fn set_usage(&mut self, input_tokens: u64, output_tokens: u64) {
+        self.input_tokens = Some(input_tokens);
+        self.output_tokens = Some(output_tokens);
+        let _ = self.sender.send(SseEvent::Usage(input_tokens, output_tokens));
+    }
+
+    pub fn take(self) -> (String, Vec<ToolCall>, Option<u64>, Option<u64>) {
         let Self {
-            buffer, tool_calls, ..
+            buffer,
+            tool_calls,
+            input_tokens,
+            output_tokens,
+            ..
         } = self;
-        (buffer, tool_calls)
+        (buffer, tool_calls, input_tokens, output_tokens)
     }
 }
 
@@ -81,6 +95,7 @@ impl SseHandler {
 pub enum SseEvent {
     Text(String),
     Done,
+    Usage(u64, u64),
 }
 
 #[derive(Debug)]
@@ -327,5 +342,57 @@ mod tests {
             parser.buffer.len(),
             json_obj.len() * 2
         );
+    }
+
+    // ── P1-TESTS: SseHandler token storage and SseEvent::Usage tests ──
+    // SseHandler token storage and SseEvent::Usage tests
+
+    #[tokio::test]
+    async fn test_sse_handler_set_usage_and_take() {
+        use tokio::sync::mpsc::unbounded_channel;
+        // Verify set_usage stores values and take() returns them
+        let abort = create_abort_signal();
+        let (tx, mut rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, abort);
+
+        // Before set_usage, take should return None tokens
+        // (we need a fresh handler for the "no usage" case)
+        // Instead, test with usage set:
+        handler.text("hello").unwrap();
+        handler.set_usage(100, 50);
+
+        let (text, tool_calls, input_tokens, output_tokens) = handler.take();
+        assert_eq!(text, "hello");
+        assert!(tool_calls.is_empty());
+        assert_eq!(input_tokens, Some(100));
+        assert_eq!(output_tokens, Some(50));
+
+        // Verify set_usage also sent SseEvent::Usage through the channel
+        // (drain text event first, then check for Usage event)
+        let evt1 = rx.recv().await.unwrap();
+        assert!(matches!(evt1, SseEvent::Text(_)));
+        let evt2 = rx.recv().await.unwrap();
+        assert!(matches!(evt2, SseEvent::Usage(100, 50)));
+    }
+
+    #[tokio::test]
+    async fn test_sse_handler_take_without_usage() {
+        // Verify take() returns None tokens when set_usage was never called
+        use tokio::sync::mpsc::unbounded_channel;
+        let abort = create_abort_signal();
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, abort);
+        handler.text("world").unwrap();
+        let (text, tool_calls, input_tokens, output_tokens) = handler.take();
+        assert_eq!(text, "world");
+        assert!(tool_calls.is_empty());
+        assert_eq!(input_tokens, None);
+        assert_eq!(output_tokens, None);
+    }
+
+    #[test]
+    fn test_sse_event_usage_variant() {
+        let event = SseEvent::Usage(200, 75);
+        assert!(matches!(event, SseEvent::Usage(200, 75)));
     }
 }

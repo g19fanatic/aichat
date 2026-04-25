@@ -55,6 +55,7 @@ pub async fn raw_stream(
                 SseEvent::Done => {
                     break;
                 }
+                SseEvent::Usage(..) => {}
             }
         }
     }
@@ -148,6 +149,7 @@ async fn markdown_stream_inner(
                 SseEvent::Done => {
                     break 'outer;
                 }
+                SseEvent::Usage(..) => {}
             }
         }
 
@@ -174,6 +176,7 @@ async fn gather_events(rx: &mut UnboundedReceiver<SseEvent>) -> Vec<SseEvent> {
                         done = true;
                         break;
                     }
+                    SseEvent::Usage(..) => {}
                 }
             }
         } => {}

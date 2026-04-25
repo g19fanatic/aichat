@@ -179,6 +179,16 @@ async fn chat_completions_streaming(
                     function_arguments.clear();
                     function_id.clear();
                 }
+                "message-end" => {
+                    if let (Some(input_tokens), Some(output_tokens)) = (
+                        data["delta"]["usage"]["billed_units"]["input_tokens"].as_u64()
+                            .or_else(|| data["usage"]["billed_units"]["input_tokens"].as_u64()),
+                        data["delta"]["usage"]["billed_units"]["output_tokens"].as_u64()
+                            .or_else(|| data["usage"]["billed_units"]["output_tokens"].as_u64()),
+                    ) {
+                        handler.set_usage(input_tokens, output_tokens);
+                    }
+                }
                 _ => {}
             }
         }

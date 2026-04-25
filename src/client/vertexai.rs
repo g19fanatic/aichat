@@ -228,6 +228,12 @@ pub async fn gemini_chat_completions_streaming(
             {
                 bail!("Blocked due to safety")
             }
+            if let (Some(input_tokens), Some(output_tokens)) = (
+                data["usageMetadata"]["promptTokenCount"].as_u64(),
+                data["usageMetadata"]["candidatesTokenCount"].as_u64(),
+            ) {
+                handler.set_usage(input_tokens, output_tokens);
+            }
 
             Ok(())
         };

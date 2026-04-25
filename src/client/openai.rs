@@ -191,6 +191,12 @@ pub async fn openai_chat_completions_streaming(
                 function_id = id.to_string();
             }
         }
+        if let (Some(input_tokens), Some(output_tokens)) = (
+            data["usage"]["prompt_tokens"].as_u64(),
+            data["usage"]["completion_tokens"].as_u64(),
+        ) {
+            handler.set_usage(input_tokens, output_tokens);
+        }
         Ok(false)
     };
 
@@ -328,6 +334,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     }
     if stream {
         body["stream"] = true.into();
+        body["stream_options"] = json!({"include_usage": true});
     }
     if let Some(functions) = functions {
         body["tools"] = functions

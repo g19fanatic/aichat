@@ -62,6 +62,14 @@ pub struct Session {
     autoname: Option<AutoName>,
     #[serde(skip)]
     tokens: usize,
+    #[serde(skip)]
+    api_input_tokens: Option<u64>,
+    #[serde(skip)]
+    api_output_tokens: Option<u64>,
+    #[serde(skip)]
+    cumulative_input_tokens: u64,
+    #[serde(skip)]
+    cumulative_output_tokens: u64,
 }
 
 impl Session {
@@ -135,6 +143,33 @@ impl Session {
         self.tokens = self.model().total_tokens(&self.messages);
     }
 
+    pub fn api_input_tokens(&self) -> Option<u64> {
+        self.api_input_tokens
+    }
+
+    pub fn api_output_tokens(&self) -> Option<u64> {
+        self.api_output_tokens
+    }
+
+    pub fn cumulative_input_tokens(&self) -> u64 {
+        self.cumulative_input_tokens
+    }
+
+    pub fn cumulative_output_tokens(&self) -> u64 {
+        self.cumulative_output_tokens
+    }
+
+    pub fn set_api_tokens(&mut self, input_tokens: Option<u64>, output_tokens: Option<u64>) {
+        self.api_input_tokens = input_tokens;
+        self.api_output_tokens = output_tokens;
+        if let Some(tokens) = input_tokens {
+            self.cumulative_input_tokens += tokens;
+        }
+        if let Some(tokens) = output_tokens {
+            self.cumulative_output_tokens += tokens;
+        }
+    }
+
     pub fn has_user_messages(&self) -> bool {
         self.messages.iter().any(|v| v.role.is_user())
     }
@@ -169,6 +204,19 @@ impl Session {
             data["total/max"] = format!("{percent}%").into();
         }
         data["messages"] = json!(self.messages);
+
+        if let Some(api_in) = self.api_input_tokens() {
+            data["api_input_tokens"] = api_in.into();
+        }
+        if let Some(api_out) = self.api_output_tokens() {
+            data["api_output_tokens"] = api_out.into();
+        }
+        if self.cumulative_input_tokens > 0 {
+            data["cumulative_input_tokens"] = self.cumulative_input_tokens.into();
+        }
+        if self.cumulative_output_tokens > 0 {
+            data["cumulative_output_tokens"] = self.cumulative_output_tokens.into();
+        }
 
         let output = serde_yaml::to_string(&data)
             .with_context(|| format!("Unable to show info about session '{}'", &self.name))?;
@@ -355,6 +403,8 @@ impl Session {
         ));
         self.dirty = true;
         self.update_tokens();
+        self.api_input_tokens = None;
+        self.api_output_tokens = None;
     }
 
     pub fn need_autoname(&self) -> bool {
@@ -466,7 +516,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn add_message(&mut self, input: &Input, output: &str) -> Result<()> {
+    pub fn add_message(&mut self, input: &Input, output: &str, input_tokens: Option<u64>, output_tokens: Option<u64>) -> Result<()> {
         if input.continue_output().is_some() {
             if let Some(message) = self.messages.last_mut() {
                 if let MessageContent::Text(text) = &mut message.content {
@@ -505,6 +555,7 @@ impl Session {
         }
         self.dirty = true;
         self.update_tokens();
+        self.set_api_tokens(input_tokens, output_tokens);
         Ok(())
     }
 
@@ -515,6 +566,10 @@ impl Session {
         self.autoname = None;
         self.dirty = true;
         self.update_tokens();
+        self.api_input_tokens = None;
+        self.api_output_tokens = None;
+        self.cumulative_input_tokens = 0;
+        self.cumulative_output_tokens = 0;
     }
 
     pub fn echo_messages(&self, input: &Input) -> String {
@@ -634,5 +689,64 @@ impl AutoName {
     }
     pub fn need(&self) -> bool {
         !self.naming && self.chat_history.is_some() && self.name.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_api_tokens_stores_values() {
+        let mut session = Session::default();
+        session.set_api_tokens(Some(100), Some(50));
+        assert_eq!(session.api_input_tokens(), Some(100));
+        assert_eq!(session.api_output_tokens(), Some(50));
+    }
+
+    #[test]
+    fn test_set_api_tokens_accumulates_cumulative() {
+        let mut session = Session::default();
+        session.set_api_tokens(Some(100), Some(50));
+        assert_eq!(session.cumulative_input_tokens(), 100);
+        assert_eq!(session.cumulative_output_tokens(), 50);
+        session.set_api_tokens(Some(200), Some(75));
+        assert_eq!(session.cumulative_input_tokens(), 300);
+        assert_eq!(session.cumulative_output_tokens(), 125);
+    }
+
+    #[test]
+    fn test_set_api_tokens_none_does_not_accumulate() {
+        let mut session = Session::default();
+        session.set_api_tokens(None, None);
+        assert_eq!(session.api_input_tokens(), None);
+        assert_eq!(session.api_output_tokens(), None);
+        assert_eq!(session.cumulative_input_tokens(), 0);
+        assert_eq!(session.cumulative_output_tokens(), 0);
+    }
+
+    #[test]
+    fn test_clear_messages_resets_api_counters() {
+        let mut session = Session::default();
+        session.set_api_tokens(Some(100), Some(50));
+        session.clear_messages();
+        assert_eq!(session.api_input_tokens(), None);
+        assert_eq!(session.api_output_tokens(), None);
+        assert_eq!(session.cumulative_input_tokens(), 0);
+        assert_eq!(session.cumulative_output_tokens(), 0);
+    }
+
+    #[test]
+    fn test_compress_resets_last_request_keeps_cumulative() {
+        let mut session = Session::default();
+        session.set_api_tokens(Some(100), Some(50));
+        session.set_api_tokens(Some(200), Some(75));
+        // cumulative should be 300/125
+        session.compress("summary".to_string());
+        assert_eq!(session.api_input_tokens(), None);
+        assert_eq!(session.api_output_tokens(), None);
+        // cumulative preserved across compress
+        assert_eq!(session.cumulative_input_tokens(), 300);
+        assert_eq!(session.cumulative_output_tokens(), 125);
     }
 }

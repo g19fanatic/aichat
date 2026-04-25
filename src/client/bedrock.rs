@@ -331,6 +331,14 @@ async fn chat_completions_streaming(
                                 ))?;
                             }
                         }
+                        "metadata" => {
+                            if let (Some(input_tokens), Some(output_tokens)) = (
+                                data["usage"]["inputTokens"].as_u64(),
+                                data["usage"]["outputTokens"].as_u64(),
+                            ) {
+                                handler.set_usage(input_tokens, output_tokens);
+                            }
+                        }
                         _ => {}
                     }
                 }
