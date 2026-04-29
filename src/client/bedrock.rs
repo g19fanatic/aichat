@@ -456,7 +456,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                                 "toolUseId": tool_result.call.id,
                                 "content": [
                                     {
-                                        "json": tool_result.output,
+                                        "json": ensure_json_object(tool_result.output),
                                     }
                                 ]
                             }
@@ -690,4 +690,59 @@ fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> 
     let k_region = hmac_sha256(&k_date, region);
     let k_service = hmac_sha256(&k_region, service);
     hmac_sha256(&k_service, "aws4_request")
+}
+
+/// Ensures a serde_json::Value is a JSON object, as required by the Bedrock
+/// Converse API for `toolResult.content[].json`.  Non-object values (strings,
+/// numbers, arrays, booleans, nulls) are wrapped in `{"result": <value>}`.
+fn ensure_json_object(value: Value) -> Value {
+    match value {
+        Value::Object(_) => value,
+        _ => json!({"result": value}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::function::{ToolCall, ToolResult};
+
+    /// Helper: build a ChatCompletionsData whose only non-system message is a
+    /// ToolCalls message carrying a single tool result with the given `output`.
+    fn build_body_with_tool_output(output: Value) -> Value {
+        let call = ToolCall::new("test_fn".into(), json!({}), Some("call_1".into()));
+        let tr = ToolResult::new(call, output);
+        let tc = MessageContentToolCalls::new(vec![tr], String::new());
+
+        let messages = vec![
+            Message::new(MessageRole::System, MessageContent::Text("sys".into())),
+            Message::new(MessageRole::User, MessageContent::ToolCalls(tc)),
+        ];
+        let data = ChatCompletionsData { messages, temperature: None, top_p: None, functions: None, stream: false };
+        let model = Model::new("bedrock", "test-model");
+        build_chat_completions_body(data, &model).unwrap()
+    }
+
+    fn extract_tool_json(body: &Value) -> &Value {
+        // messages[0] = user (ToolCalls assistant), messages[1] = user (toolResult)
+        // The second message in the body messages array has the toolResult
+        &body["messages"][1]["content"][0]["toolResult"]["content"][0]["json"]
+    }
+
+    #[test]
+    fn test_bedrock_tool_result_json_string_wrapped() {
+        let body = build_body_with_tool_output(json!("DONE"));
+        let j = extract_tool_json(&body);
+        assert!(j.is_object(), "string tool output must be wrapped: {j}");
+        assert_eq!(j["result"], json!("DONE"));
+    }
+
+    #[test]
+    fn test_bedrock_tool_result_json_object_passthrough() {
+        let orig = json!({"key": "value"});
+        let body = build_body_with_tool_output(orig.clone());
+        let j = extract_tool_json(&body);
+        assert!(j.is_object());
+        assert_eq!(*j, orig);
+    }
 }
