@@ -309,19 +309,17 @@ pub fn run_llm_function(
         .join("");
     envs.insert("PATH".into(), format!("{prepend_path}{current_path}"));
 
-    // Check if LLM_OUTPUT is already defined in the environment
+    // Track whether LLM_OUTPUT was predefined (used for println guard only)
     let llm_output_defined = llm_output.is_some();
-    
-    // Only create temp_file if LLM_OUTPUT isn't already defined
-    let temp_file = if !llm_output_defined {
-        let temp = temp_file("-eval-", "");
-        debug!("Creating temporary file for LLM_OUTPUT: {}", temp.display());
-        envs.insert("LLM_OUTPUT".into(), temp.display().to_string());
-        temp
-    } else {
-        // Use a placeholder PathBuf that won't be used
-        PathBuf::new()
-    };
+
+    // ALWAYS create a per-call temp file for LLM_OUTPUT to prevent shared-file
+    // race condition when parallel tool calls run via rayon's par_iter().
+    // Even when LLM_OUTPUT is pre-set (e.g., by vim-llm-assistant), each child
+    // process must write to its own isolated file to avoid result accumulation
+    // across parallel calls and across multi-round tool call sequences.
+    let temp_file = temp_file("-eval-", "");
+    debug!("Creating per-call temporary file for LLM_OUTPUT: {}", temp_file.display());
+    envs.insert("LLM_OUTPUT".into(), temp_file.display().to_string());
 
     #[cfg(windows)]
     let cmd_name = polyfill_cmd_name(&cmd_name, &bin_dirs);
@@ -332,54 +330,25 @@ pub fn run_llm_function(
         println!("**~~ {} ~~**", dimmed_text(&prompt));
         debug!("Displaying tool call prompt (IS_STDOUT_TERMINAL: {}, llm_output_defined: {})", *IS_STDOUT_TERMINAL, llm_output_defined);
     }
-    
+
     let exit_code = run_command(&cmd_name, &cmd_args, Some(envs))
-        .map_err(|err| anyhow!("Unable to run {cmd_name}, {err}"))?;
+        .map_err(|err| {
+            let _ = fs::remove_file(&temp_file);
+            anyhow!("Unable to run {cmd_name}, {err}")
+        })?;
     if exit_code != 0 {
+        let _ = fs::remove_file(&temp_file);
         bail!("Tool call exit with {exit_code}");
     }
-    
+
     let mut output = None;
-    
-    if llm_output_defined {
-        // If LLM_OUTPUT was predefined, get the value directly from environment
-        debug!("Using predefined LLM_OUTPUT environment variable");
-        if let Some(ref llm_path) = llm_output {
-            let path = Path::new(&llm_path);
-            if path.exists() {
-                let contents = fs::read_to_string(path).context("Failed to retrieve tool call output")?;
-                if !contents.is_empty() {
-                    output = Some(contents);
-                }
-            }
-        }
-    } else if temp_file.exists() {
-        // Use the temporary file we created
-        debug!("Reading tool output from temporary file: {}", temp_file.display());
+
+    if temp_file.exists() {
+        debug!("Reading tool output from per-call temporary file: {}", temp_file.display());
         let contents =
             fs::read_to_string(&temp_file).context("Failed to retrieve tool call output")?;
         if !contents.is_empty() {
-            // Try to parse as JSON with jsonic if the content appears to be JSON
-            if contents.trim().starts_with('{') || contents.trim().starts_with('[') {
-                // Try serde_json first (fast path), fall back to jsonic
-                match serde_json::from_str::<Value>(&contents) {
-                    Ok(value) => {
-                        output = Some(value.to_string());
-                    },
-                    Err(_) => {
-                        match jsonic::parse(&contents) {
-                            Ok(json_item) => {
-                                output = Some(json_item.as_str().unwrap_or(&contents).to_string());
-                            },
-                            Err(_) => {
-                                output = Some(contents);
-                            }
-                        }
-                    }
-                }
-            } else {
-                output = Some(contents);
-            }
+            output = Some(contents);
         }
         let _ = fs::remove_file(&temp_file);
     }
