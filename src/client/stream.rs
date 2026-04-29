@@ -264,6 +264,7 @@ impl JsonStreamParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::create_abort_signal;
 
     use bytes::Bytes;
     use futures_util::stream;
