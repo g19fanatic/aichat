@@ -294,6 +294,39 @@ pub fn claude_build_chat_completions_body(
             })
             .collect();
     }
+
+    // Smart prompt caching: enable when there's a stable prefix worth caching
+    let should_cache = body.get("system").is_some()
+        || body["messages"].as_array().map_or(false, |m| m.len() > 1)
+        || body.get("tools").is_some();
+    if should_cache {
+        body["cache_control"] = json!({"type": "ephemeral"});
+        // Explicit block-level cache_control on system message for better cache granularity
+        if let Some(system_str) = body.get("system").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+            body["system"] = json!([{
+                "type": "text",
+                "text": system_str,
+                "cache_control": {"type": "ephemeral"}
+            }]);
+        }
+        // Explicit cache_control on last message for multi-turn conversation caching
+        if let Some(messages_len) = body["messages"].as_array().map(|m| m.len()).filter(|&len| len > 1) {
+            let last_idx = messages_len - 1;
+            if let Some(content_str) = body["messages"][last_idx]["content"].as_str().map(|s| s.to_string()) {
+                body["messages"][last_idx]["content"] = json!([{
+                    "type": "text",
+                    "text": content_str,
+                    "cache_control": {"type": "ephemeral"}
+                }]);
+            } else if body["messages"][last_idx]["content"].is_array() {
+                let content_len = body["messages"][last_idx]["content"].as_array().map_or(0, |a| a.len());
+                if content_len > 0 {
+                    body["messages"][last_idx]["content"][content_len - 1]["cache_control"] = json!({"type": "ephemeral"});
+                }
+            }
+        }
+    }
+
     Ok(body)
 }
 

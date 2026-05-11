@@ -524,7 +524,64 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
             "tools": tools,
         })
     }
+
+    // Smart prompt caching: add cachePoint markers when caching is likely beneficial
+    let has_system = body.get("system").is_some();
+    let has_multi_messages = body["messages"].as_array().map_or(false, |a| a.len() > 1);
+    let has_tools = body.get("toolConfig").is_some();
+    let should_cache = has_system || has_multi_messages || has_tools;
+
+    if should_cache {
+        let cache_point = match bedrock_cache_ttl(model) {
+            Some(ttl) => json!({"cachePoint": {"type": "default", "ttl": ttl}}),
+            None => json!({"cachePoint": {"type": "default"}}),
+        };
+
+        // Add cachePoint after system text
+        if let Some(system_arr) = body.get_mut("system").and_then(|s| s.as_array_mut()) {
+            system_arr.push(cache_point.clone());
+        }
+
+        // Add cachePoint at end of last message's content for multi-turn caching
+        if has_multi_messages {
+            if let Some(content_arr) = body.get_mut("messages")
+                .and_then(|m| m.as_array_mut())
+                .and_then(|arr| arr.last_mut())
+                .and_then(|msg| msg.get_mut("content"))
+                .and_then(|c| c.as_array_mut())
+            {
+                content_arr.push(cache_point.clone());
+            }
+        }
+
+        // Add cachePoint after tools
+        if let Some(tools_arr) = body.get_mut("toolConfig")
+            .and_then(|tc| tc.get_mut("tools"))
+            .and_then(|t| t.as_array_mut())
+        {
+            tools_arr.push(cache_point);
+        }
+    }
+
     Ok(body)
+}
+
+/// Determine the cache TTL for Bedrock prompt caching based on model name.
+/// Returns `Some("1h")` for recent Claude models that support 1-hour TTL,
+/// or `None` for older models (which use the default 5-minute TTL, represented
+/// by omitting the `ttl` field entirely).
+fn bedrock_cache_ttl(model: &Model) -> Option<&'static str> {
+    let name = model.name().to_lowercase();
+    if name.contains("4-5")
+        || name.contains("4-6")
+        || name.contains("opus-4")
+        || name.contains("sonnet-4")
+        || name.contains("haiku-4")
+    {
+        Some("1h")
+    } else {
+        None
+    }
 }
 
 fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
