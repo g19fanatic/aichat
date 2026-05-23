@@ -55,6 +55,12 @@ fn prepare_chat_completions(
     request_data.header("anthropic-version", "2023-06-01");
     request_data.header("x-api-key", api_key);
 
+    // Enable 1-hour extended cache TTL for newer Claude models
+    // Note: user patches can override this header to combine multiple beta features
+    if claude_supports_extended_cache(&self_.model) {
+        request_data.header("anthropic-beta", "extended-cache-ttl-2025-04-11");
+    }
+
     Ok(request_data)
 }
 
@@ -383,4 +389,17 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         output_tokens: data["usage"]["output_tokens"].as_u64(),
     };
     Ok(output)
+}
+
+/// Determine if a Claude model supports the extended 1-hour cache TTL.
+/// Returns true for Claude 4+ models (sonnet-4, opus-4, haiku-4, etc.)
+/// that support the `extended-cache-ttl-2025-04-11` beta.
+/// Keep in sync with bedrock_cache_ttl() in bedrock.rs.
+fn claude_supports_extended_cache(model: &Model) -> bool {
+    let name = model.name().to_lowercase();
+    name.contains("4-5")
+        || name.contains("4-6")
+        || name.contains("opus-4")
+        || name.contains("sonnet-4")
+        || name.contains("haiku-4")
 }

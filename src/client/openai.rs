@@ -340,6 +340,50 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
             })
             .collect();
     }
+
+    // Smart prompt caching for Claude models served via OpenAI-compatible providers.
+    // Enables prompt caching on providers like OpenRouter that pass through
+    // Anthropic's cache_control annotations in the OpenAI message format.
+    let model_name_lower = model.name().to_lowercase();
+    let real_name_lower = model.real_name().to_lowercase();
+    if model_name_lower.contains("claude") || real_name_lower.contains("claude") {
+        let has_multi_messages = body["messages"].as_array().map_or(false, |m| m.len() > 1);
+        let has_tools = body.get("tools").is_some();
+        let should_cache = has_multi_messages || has_tools;
+
+        if should_cache {
+            if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                // Add cache_control to system message if present
+                if let Some(system_msg) = messages.iter_mut().find(|m| m["role"] == "system") {
+                    if let Some(content_str) = system_msg["content"].as_str().map(|s| s.to_string()) {
+                        system_msg["content"] = json!([{
+                            "type": "text",
+                            "text": content_str,
+                            "cache_control": {"type": "ephemeral"}
+                        }]);
+                    }
+                }
+                // Add cache_control to last message for multi-turn caching
+                let len = messages.len();
+                if len > 1 {
+                    let last_idx = len - 1;
+                    if let Some(content_str) = messages[last_idx]["content"].as_str().map(|s| s.to_string()) {
+                        messages[last_idx]["content"] = json!([{
+                            "type": "text",
+                            "text": content_str,
+                            "cache_control": {"type": "ephemeral"}
+                        }]);
+                    } else if messages[last_idx]["content"].is_array() {
+                        let content_len = messages[last_idx]["content"].as_array().map_or(0, |a| a.len());
+                        if content_len > 0 {
+                            messages[last_idx]["content"][content_len - 1]["cache_control"] = json!({"type": "ephemeral"});
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     body
 }
 
