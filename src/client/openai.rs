@@ -2,7 +2,7 @@ use super::*;
 
 use crate::utils::strip_think_tag;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -426,7 +426,18 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     };
 
     if text.is_empty() && tool_calls.is_empty() {
-        bail!("Invalid response data: {data}");
+        // Gemini and GPT reasoning models intermittently return null content
+        // when the reasoning budget is exhausted or the proxy returns a
+        // degraded response. Warn and return empty output rather than bailing
+        // on a valid 200 response.
+        warn!("Received empty content and no tool calls from model (null content response). Full response: {data}");
+        return Ok(ChatCompletionsOutput {
+            text: String::new(),
+            tool_calls: vec![],
+            id: data["id"].as_str().map(|v| v.to_string()),
+            input_tokens: data["usage"]["prompt_tokens"].as_u64(),
+            output_tokens: data["usage"]["completion_tokens"].as_u64(),
+        });
     }
     let text = if !reasoning.is_empty() {
         format!("<think>\n{reasoning}\n</think>\n\n{text}")
