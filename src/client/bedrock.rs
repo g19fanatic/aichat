@@ -20,10 +20,30 @@ pub struct BedrockConfig {
     pub secret_access_key: Option<String>,
     pub region: Option<String>,
     pub session_token: Option<String>,
+    pub profile: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
+}
+
+/// Determines which API protocol to use for a given Bedrock model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BedrockModelCategory {
+    /// Default: AWS Converse API (/model/{id}/converse)
+    Converse,
+    /// OpenAI Chat Completions API (/v1/chat/completions)
+    OpenAI,
+}
+
+impl BedrockModelCategory {
+    fn from_model_name(model_name: &str) -> Self {
+        if model_name.starts_with("openai.") {
+            BedrockModelCategory::OpenAI
+        } else {
+            BedrockModelCategory::Converse
+        }
+    }
 }
 
 impl BedrockClient {
@@ -42,33 +62,56 @@ impl BedrockClient {
         &self,
         client: &ReqwestClient,
         data: ChatCompletionsData,
-    ) -> Result<RequestBuilder> {
+    ) -> Result<(RequestBuilder, BedrockModelCategory)> {
+        let model_name = self.model.real_name();
+        let model_category = BedrockModelCategory::from_model_name(&model_name);
+
+        let config_profile = self.config.profile.as_deref();
         let (access_key_id, secret_access_key, session_token) =
-            fetch_bedrock_creds_from_cli().unwrap_or_else(|| (
+            fetch_bedrock_creds_from_cli(config_profile).unwrap_or_else(|| (
                 self.get_access_key_id().unwrap_or_default(),
                 self.get_secret_access_key().unwrap_or_default(),
                 self.get_session_token().ok(),
             ));
         let region = self.get_region()?;
-        let host = format!("bedrock-runtime.{region}.amazonaws.com");
-
-        let model_name = &self.model.real_name();
-
-        let uri = if data.stream {
-            format!("/model/{model_name}/converse-stream")
-        } else {
-            format!("/model/{model_name}/converse")
+        let host = match model_category {
+            BedrockModelCategory::OpenAI => format!("bedrock-mantle.{region}.api.aws"),
+            BedrockModelCategory::Converse => format!("bedrock-runtime.{region}.amazonaws.com"),
         };
 
-        let body = build_chat_completions_body(data, &self.model)?;
+        let (uri, body) = match model_category {
+            BedrockModelCategory::Converse => {
+                let uri = if data.stream {
+                    format!("/model/{model_name}/converse-stream")
+                } else {
+                    format!("/model/{model_name}/converse")
+                };
+                let body = build_chat_completions_body(data, &self.model)?;
+                (uri, body)
+            }
+            BedrockModelCategory::OpenAI => {
+                let uri = "/openai/v1/responses".to_string();
+                let body = build_responses_api_body(data, &self.model);
+                (uri, body)
+            }
+        };
 
         let mut request_data = RequestData::new("", body);
         self.patch_request_data(&mut request_data);
         let RequestData {
             url: _,
-            headers,
+            mut headers,
             body,
         } = request_data;
+
+        let service = match model_category {
+            BedrockModelCategory::OpenAI => "bedrock-mantle",
+            BedrockModelCategory::Converse => "bedrock",
+        };
+
+        if model_category == BedrockModelCategory::OpenAI {
+            headers.insert("x-amzn-mantle-client-agent".into(), "codex".into());
+        }
 
         let builder = aws_fetch(
             client,
@@ -81,7 +124,7 @@ impl BedrockClient {
             AwsRequest {
                 method: Method::POST,
                 host,
-                service: "bedrock".into(),
+                service: service.into(),
                 uri,
                 querystring: "".into(),
                 headers,
@@ -89,7 +132,7 @@ impl BedrockClient {
             },
         )?;
 
-        Ok(builder)
+        Ok((builder, model_category))
     }
 
     fn embeddings_builder(
@@ -97,8 +140,9 @@ impl BedrockClient {
         client: &ReqwestClient,
         data: &EmbeddingsData,
     ) -> Result<RequestBuilder> {
+        let config_profile = self.config.profile.as_deref();
         let (access_key_id, secret_access_key, session_token) =
-            fetch_bedrock_creds_from_cli().unwrap_or_else(|| (
+            fetch_bedrock_creds_from_cli(config_profile).unwrap_or_else(|| (
                 self.get_access_key_id().unwrap_or_default(),
                 self.get_secret_access_key().unwrap_or_default(),
                 self.get_session_token().ok(),
@@ -153,10 +197,11 @@ impl BedrockClient {
 /// Reads profile from BEDROCK_AWS_PROFILE env var (first) or AWS_PROFILE (fallback).
 /// Returns None if the aws CLI call fails or no profile env var is set — callers fall back
 /// to the standard config_get_fn chain (env vars / config file).
-fn fetch_bedrock_creds_from_cli() -> Option<(String, String, Option<String>)> {
+fn fetch_bedrock_creds_from_cli(config_profile: Option<&str>) -> Option<(String, String, Option<String>)> {
     let profile = std::env::var("BEDROCK_AWS_PROFILE")
         .or_else(|_| std::env::var("AWS_PROFILE"))
-        .ok()?;
+        .ok()
+        .or_else(|| config_profile.map(|s| s.to_string()))?;
 
     let output = std::process::Command::new("aws")
         .args([
@@ -202,8 +247,13 @@ impl Client for BedrockClient {
         client: &ReqwestClient,
         data: ChatCompletionsData,
     ) -> Result<ChatCompletionsOutput> {
-        let builder = self.chat_completions_builder(client, data)?;
-        chat_completions(builder).await
+        let (builder, category) = self.chat_completions_builder(client, data)?;
+        match category {
+            BedrockModelCategory::Converse => chat_completions(builder).await,
+            BedrockModelCategory::OpenAI => {
+                responses_api_chat_completions(builder, &self.model).await
+            }
+        }
     }
 
     async fn chat_completions_streaming_inner(
@@ -212,8 +262,15 @@ impl Client for BedrockClient {
         handler: &mut SseHandler,
         data: ChatCompletionsData,
     ) -> Result<()> {
-        let builder = self.chat_completions_builder(client, data)?;
-        chat_completions_streaming(builder, handler).await
+        let (builder, category) = self.chat_completions_builder(client, data)?;
+        match category {
+            BedrockModelCategory::Converse => {
+                chat_completions_streaming(builder, handler).await
+            }
+            BedrockModelCategory::OpenAI => {
+                responses_api_streaming(builder, handler, &self.model).await
+            }
+        }
     }
 
     async fn embeddings_inner(
@@ -676,20 +733,24 @@ fn aws_fetch(
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date_stamp = amz_date[0..8].to_string();
     headers.insert("host".into(), host.clone());
+    headers.insert("content-type".into(), "application/json".into());
     headers.insert("x-amz-date".into(), amz_date.clone());
     if let Some(token) = credentials.session_token.clone() {
         headers.insert("x-amz-security-token".into(), token);
     }
 
-    let canonical_headers = headers
+    let mut sorted_keys: Vec<&String> = headers.keys().collect();
+    sorted_keys.sort();
+
+    let canonical_headers = sorted_keys
         .iter()
-        .map(|(key, value)| format!("{key}:{value}\n"))
+        .map(|key| format!("{}:{}\n", key, headers[key.as_str()]))
         .collect::<Vec<_>>()
         .join("");
 
-    let signed_headers = headers
+    let signed_headers = sorted_keys
         .iter()
-        .map(|(key, _)| key.as_str())
+        .map(|key| key.as_str())
         .collect::<Vec<_>>()
         .join(";");
 
@@ -736,7 +797,10 @@ fn aws_fetch(
     let mut request_builder = client.request(method, endpoint).body(body);
 
     for (key, value) in &headers {
-        request_builder = request_builder.header(key, value);
+        if key == "host" {
+            continue;
+        }
+        request_builder = request_builder.header(key.as_str(), value.as_str());
     }
 
     Ok(request_builder)
@@ -747,6 +811,176 @@ fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> 
     let k_region = hmac_sha256(&k_date, region);
     let k_service = hmac_sha256(&k_region, service);
     hmac_sha256(&k_service, "aws4_request")
+}
+
+/// Build a request body for the OpenAI Responses API format.
+/// Converts ChatCompletionsData messages into the "input" field expected by /v1/responses.
+fn build_responses_api_body(data: ChatCompletionsData, model: &Model) -> Value {
+    let ChatCompletionsData {
+        messages,
+        temperature,
+        top_p,
+        functions: _,
+        stream,
+    } = data;
+
+    // Convert messages to the Responses API "input" format.
+    // The Responses API accepts messages as an array of {role, content} objects,
+    // similar to chat completions but with "input" key instead of "messages".
+    // System messages become the "instructions" field.
+    let mut instructions = String::new();
+    let mut input: Vec<Value> = Vec::new();
+
+    for message in messages {
+        let Message { role, content } = message;
+        match role {
+            MessageRole::System => {
+                // System messages go into "instructions" field
+                if let MessageContent::Text(text) = content {
+                    if !instructions.is_empty() {
+                        instructions.push('\n');
+                    }
+                    instructions.push_str(&text);
+                }
+            }
+            _ => {
+                // User and assistant messages go into "input" array
+                match content {
+                    MessageContent::Text(text) => {
+                        input.push(json!({
+                            "role": role,
+                            "content": text,
+                        }));
+                    }
+                    MessageContent::Array(parts) => {
+                        // Multi-part content (text + images)
+                        let content_parts: Vec<Value> = parts.into_iter().map(|part| {
+                            match part {
+                                MessageContentPart::Text { text } => json!({"type": "input_text", "text": text}),
+                                MessageContentPart::ImageUrl { image_url } => json!({"type": "input_image", "image_url": image_url.url}),
+                            }
+                        }).collect();
+                        input.push(json!({
+                            "role": role,
+                            "content": content_parts,
+                        }));
+                    }
+                    MessageContent::ToolCalls(_) => {
+                        // Skip tool calls for now — Mantle may not support them
+                        // in the same way. Just include as text if there's text content.
+                    }
+                }
+            }
+        }
+    }
+
+    let mut body = json!({
+        "model": model.real_name(),
+        "input": input,
+        "stream": stream,
+    });
+
+    if !instructions.is_empty() {
+        body["instructions"] = json!(instructions);
+    }
+    if let Some(v) = temperature {
+        body["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        body["top_p"] = v.into();
+    }
+    if let Some(v) = model.max_tokens_param() {
+        body["max_output_tokens"] = v.into();
+    }
+
+    body
+}
+
+/// Handle non-streaming Responses API response.
+/// Extracts text from the response output array.
+async fn responses_api_chat_completions(
+    builder: RequestBuilder,
+    _model: &Model,
+) -> Result<ChatCompletionsOutput> {
+    let res = builder.send().await?;
+    let status = res.status();
+    let data: Value = res.json().await?;
+    if !status.is_success() {
+        catch_error(&data, status.as_u16())?;
+    }
+
+    debug!("responses-api-data: {data}");
+
+    // Extract text from Responses API format:
+    // {"output": [{"type": "message", "content": [{"type": "output_text", "text": "..."}]}]}
+    let mut text = String::new();
+    if let Some(output_arr) = data["output"].as_array() {
+        for item in output_arr {
+            if let Some(content_arr) = item["content"].as_array() {
+                for content_item in content_arr {
+                    if let Some(t) = content_item["text"].as_str() {
+                        if !text.is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        text.push_str(t);
+                    }
+                }
+            }
+        }
+    }
+
+    if text.is_empty() {
+        bail!("Invalid Responses API response data: {data}");
+    }
+
+    let output = ChatCompletionsOutput {
+        text,
+        tool_calls: vec![],
+        id: data["id"].as_str().map(|s| s.to_string()),
+        input_tokens: data["usage"]["input_tokens"].as_u64(),
+        output_tokens: data["usage"]["output_tokens"].as_u64(),
+    };
+    Ok(output)
+}
+
+/// Handle streaming Responses API response.
+/// Parses SSE events for text deltas from `response.output_text.delta` events.
+async fn responses_api_streaming(
+    builder: RequestBuilder,
+    handler: &mut SseHandler,
+    _model: &Model,
+) -> Result<()> {
+    let handle = |message: SseMmessage| -> Result<bool> {
+        // The Responses API streaming uses SSE with event types like:
+        // event: response.output_text.delta
+        // data: {"type":"response.output_text.delta","delta":"text chunk"}
+        //
+        // event: response.completed
+        // data: {"type":"response.completed",...}
+        let data: Value = match serde_json::from_str(&message.data) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+
+        let event_type = data["type"].as_str().unwrap_or("");
+        match event_type {
+            "response.output_text.delta" => {
+                if let Some(delta) = data["delta"].as_str() {
+                    handler.text(delta)?;
+                }
+            }
+            "response.completed" | "response.done" => {
+                return Ok(true);
+            }
+            _ => {
+                // Ignore other event types (response.created, response.output_item.added, etc.)
+            }
+        }
+
+        Ok(false)
+    };
+
+    sse_stream(builder, handle).await
 }
 
 /// Ensures a serde_json::Value is a JSON object, as required by the Bedrock
