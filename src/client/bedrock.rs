@@ -820,7 +820,7 @@ fn build_responses_api_body(data: ChatCompletionsData, model: &Model) -> Value {
         messages,
         temperature,
         top_p,
-        functions: _,
+        functions,
         stream,
     } = data;
 
@@ -865,9 +865,27 @@ fn build_responses_api_body(data: ChatCompletionsData, model: &Model) -> Value {
                             "content": content_parts,
                         }));
                     }
-                    MessageContent::ToolCalls(_) => {
-                        // Skip tool calls for now — Mantle may not support them
-                        // in the same way. Just include as text if there's text content.
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results,
+                        ..
+                    }) => {
+                        // Convert tool calls to Responses API format:
+                        // Each ToolResult generates a function_call item (the assistant's call)
+                        // followed by a function_call_output item (the tool's response).
+                        for tool_result in tool_results {
+                            let call_id = tool_result.call.id.clone().unwrap_or_default();
+                            input.push(json!({
+                                "type": "function_call",
+                                "name": tool_result.call.name,
+                                "call_id": call_id,
+                                "arguments": tool_result.call.arguments.to_string(),
+                            }));
+                            input.push(json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": tool_result.output.to_string(),
+                            }));
+                        }
                     }
                 }
             }
@@ -892,6 +910,20 @@ fn build_responses_api_body(data: ChatCompletionsData, model: &Model) -> Value {
     if let Some(v) = model.max_tokens_param() {
         body["max_output_tokens"] = v.into();
     }
+    if let Some(functions) = functions {
+        body["tools"] = functions
+            .iter()
+            .map(|v| {
+                json!({
+                    "type": "function",
+                    "name": v.name,
+                    "description": v.description,
+                    "parameters": v.parameters,
+                    "strict": false,
+                })
+            })
+            .collect();
+    }
 
     body
 }
@@ -914,6 +946,7 @@ async fn responses_api_chat_completions(
     // Extract text from Responses API format:
     // {"output": [{"type": "message", "content": [{"type": "output_text", "text": "..."}]}]}
     let mut text = String::new();
+    let mut tool_calls = vec![];
     if let Some(output_arr) = data["output"].as_array() {
         for item in output_arr {
             if let Some(content_arr) = item["content"].as_array() {
@@ -926,16 +959,41 @@ async fn responses_api_chat_completions(
                     }
                 }
             }
+            // Parse tool call items: {"type": "function_call", "name": "...", "arguments": "...", "call_id": "..."}
+            if item["type"].as_str() == Some("function_call") {
+                if let (Some(name), Some(arguments_str)) = (
+                    item["name"].as_str(),
+                    item["arguments"].as_str(),
+                ) {
+                    let call_id = item["call_id"].as_str().map(|s| s.to_string());
+                    let arguments: Value = arguments_str.parse().with_context(|| {
+                        format!("Tool call '{name}' has non-JSON arguments '{arguments_str}'")
+                    })?;
+                    tool_calls.push(ToolCall::new(
+                        name.to_string(),
+                        arguments,
+                        call_id,
+                    ));
+                }
+            }
         }
     }
 
-    if text.is_empty() {
-        bail!("Invalid Responses API response data: {data}");
+    if text.is_empty() && tool_calls.is_empty() {
+        // GPT-5.5 may return empty output due to strict schema constraints or other issues.
+        // Return empty response instead of erroring, allowing retry/graceful handling upstream.
+        return Ok(ChatCompletionsOutput {
+            text: String::new(),
+            tool_calls: vec![],
+            id: data["id"].as_str().map(|s| s.to_string()),
+            input_tokens: data["usage"]["input_tokens"].as_u64(),
+            output_tokens: data["usage"]["output_tokens"].as_u64(),
+        });
     }
 
     let output = ChatCompletionsOutput {
         text,
-        tool_calls: vec![],
+        tool_calls,
         id: data["id"].as_str().map(|s| s.to_string()),
         input_tokens: data["usage"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["output_tokens"].as_u64(),
@@ -950,6 +1008,9 @@ async fn responses_api_streaming(
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
+    let mut function_name = String::new();
+    let mut function_arguments = String::new();
+    let mut function_call_id = String::new();
     let handle = |message: SseMmessage| -> Result<bool> {
         // The Responses API streaming uses SSE with event types like:
         // event: response.output_text.delta
@@ -969,7 +1030,32 @@ async fn responses_api_streaming(
                     handler.text(delta)?;
                 }
             }
-            "response.completed" | "response.done" => {
+            "response.function_call_arguments.delta" => {
+                if let Some(delta) = data["delta"].as_str() {
+                    function_arguments.push_str(delta);
+                }
+                if function_name.is_empty() {
+                    if let Some(name) = data["name"].as_str() {
+                        function_name = name.to_string();
+                    }
+                }
+                if function_call_id.is_empty() {
+                    if let Some(id) = data["call_id"].as_str() {
+                        function_call_id = id.to_string();
+                    }
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let name = data["name"].as_str().unwrap_or(&function_name).to_string();
+                let args_str = data["arguments"].as_str().unwrap_or(&function_arguments);
+                let arguments: Value = args_str.parse().unwrap_or(json!({}));
+                let call_id = data["call_id"].as_str().map(|s| s.to_string()).or_else(|| if function_call_id.is_empty() { None } else { Some(function_call_id.clone()) });
+                handler.tool_call(ToolCall::new(name, arguments, call_id))?;
+                function_name.clear();
+                function_arguments.clear();
+                function_call_id.clear();
+            }
+            "response.completed" | "response.done" | "response.finished" => {
                 return Ok(true);
             }
             _ => {
