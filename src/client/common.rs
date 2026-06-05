@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::time::sleep;
 
 const MODELS_YAML: &str = include_str!("../../models.yaml");
 
@@ -71,10 +72,30 @@ pub trait Client: Sync + Send {
             return Ok(ChatCompletionsOutput::new(&content));
         }
         let client = self.build_client()?;
-        let data = input.prepare_completion_data(self.model(), false)?;
-        self.chat_completions_inner(&client, data)
-            .await
-            .with_context(|| "Failed to call chat-completions api")
+        let max_retries = 3u32;
+        let mut last_err = None;
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let backoff_secs = 5u64 * 2u64.pow(attempt - 1);
+                eprintln!(
+                    "Warning: Retriable error (attempt {attempt}/{max_retries}), retrying in {backoff_secs}s..."
+                );
+                sleep(Duration::from_secs(backoff_secs)).await;
+            }
+            let data = input.prepare_completion_data(self.model(), false)?;
+            match self.chat_completions_inner(&client, data).await {
+                Ok(output) => return Ok(output),
+                Err(err) if is_retriable_error(&err) => {
+                    last_err = Some(err);
+                    continue;
+                }
+                Err(err) => return Err(err).with_context(|| "Failed to call chat-completions api"),
+            }
+        }
+        Err(last_err.unwrap()).with_context(|| {
+            format!("Failed to call chat-completions api (after {max_retries} retries)")
+        })
     }
 
     async fn chat_completions_streaming(
@@ -92,8 +113,31 @@ pub trait Client: Sync + Send {
                     return Ok(());
                 }
                 let client = self.build_client()?;
-                let data = input.prepare_completion_data(self.model(), true)?;
-                self.chat_completions_streaming_inner(&client, handler, data).await
+                let max_retries = 3u32;
+                let mut last_err = None;
+
+                for attempt in 0..=max_retries {
+                    if attempt > 0 {
+                        if handler.has_output() {
+                            break;
+                        }
+                        let backoff_secs = 5u64 * 2u64.pow(attempt - 1);
+                        eprintln!(
+                            "Warning: Retriable error (attempt {attempt}/{max_retries}), retrying in {backoff_secs}s..."
+                        );
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                    }
+                    let data = input.prepare_completion_data(self.model(), true)?;
+                    match self.chat_completions_streaming_inner(&client, handler, data).await {
+                        Ok(()) => return Ok(()),
+                        Err(err) if is_retriable_error(&err) && !handler.has_output() => {
+                            last_err = Some(err);
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(last_err.unwrap())
             } => {
                 handler.done();
                 ret.with_context(|| "Failed to call chat-completions api")
@@ -511,6 +555,16 @@ pub async fn response_to_json(res: Response) -> Result<Value> {
         let preview = body_preview(&body);
         format!("Non-JSON response (status: {status}, content-type: {content_type}): {preview}")
     })
+}
+
+/// Check if an error represents a retriable HTTP gateway error (502/504).
+/// Matches against the error message format produced by `response_to_json()`.
+pub fn is_retriable_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("status: 504 Gateway")
+        || msg.contains("status: 502 Bad Gateway")
+        || (msg.contains("status: 504") && msg.contains("Empty response body"))
+        || (msg.contains("status: 502") && msg.contains("Empty response body"))
 }
 
 pub fn catch_error(data: &Value, status: u16) -> Result<()> {
@@ -1105,5 +1159,43 @@ mod tests {
             "Preview should be ≥203 chars, got len: {}",
             preview.len()
         );
+    }
+
+    #[test]
+    fn test_is_retriable_error_504() {
+        let err = anyhow::anyhow!(
+            "Non-JSON response (status: 504 Gateway Timeout, content-type: text/html): <html>..."
+        );
+        assert!(is_retriable_error(&err));
+    }
+
+    #[test]
+    fn test_is_retriable_error_502() {
+        let err = anyhow::anyhow!(
+            "Non-JSON response (status: 502 Bad Gateway, content-type: text/html): <html>..."
+        );
+        assert!(is_retriable_error(&err));
+    }
+
+    #[test]
+    fn test_is_retriable_error_non_retriable() {
+        let err = anyhow::anyhow!(
+            "Non-JSON response (status: 401 Unauthorized, content-type: text/html): <html>..."
+        );
+        assert!(!is_retriable_error(&err));
+    }
+
+    #[test]
+    fn test_is_retriable_error_other() {
+        let err = anyhow::anyhow!("expected value at line 1 column 1");
+        assert!(!is_retriable_error(&err));
+    }
+
+    #[test]
+    fn test_is_retriable_error_empty_body_504() {
+        let err = anyhow::anyhow!(
+            "Empty response body (status: 504, content-type: unknown). The API endpoint returned no data."
+        );
+        assert!(is_retriable_error(&err), "Empty body 504 should be retriable");
     }
 }

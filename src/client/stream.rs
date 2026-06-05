@@ -69,6 +69,11 @@ impl SseHandler {
         &self.tool_calls
     }
 
+    /// Returns true if any text or tool call output has been written to this handler.
+    pub fn has_output(&self) -> bool {
+        !self.buffer.is_empty() || !self.tool_calls.is_empty()
+    }
+
     pub fn take(self) -> (String, Vec<ToolCall>) {
         let Self {
             buffer, tool_calls, ..
