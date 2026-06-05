@@ -88,7 +88,7 @@ pub async fn openai_chat_completions(
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
-    let data: Value = res.json().await?;
+    let data: Value = response_to_json(res).await?;
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
     }
@@ -203,7 +203,7 @@ pub async fn openai_embeddings(
 ) -> Result<EmbeddingsOutput> {
     let res = builder.send().await?;
     let status = res.status();
-    let data: Value = res.json().await?;
+    let data: Value = response_to_json(res).await?;
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
     }

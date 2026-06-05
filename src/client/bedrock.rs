@@ -286,7 +286,7 @@ impl Client for BedrockClient {
 async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
-    let data: Value = res.json().await?;
+    let data: Value = response_to_json(res).await?;
 
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
@@ -303,7 +303,7 @@ async fn chat_completions_streaming(
     let res = builder.send().await?;
     let status = res.status();
     if !status.is_success() {
-        let data: Value = res.json().await?;
+        let data: Value = response_to_json(res).await?;
         catch_error(&data, status.as_u16())?;
         bail!("Invalid response data: {data}");
     }
@@ -409,7 +409,7 @@ async fn chat_completions_streaming(
 async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
     let res = builder.send().await?;
     let status = res.status();
-    let data: Value = res.json().await?;
+    let data: Value = response_to_json(res).await?;
 
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
@@ -936,7 +936,7 @@ async fn responses_api_chat_completions(
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
-    let data: Value = res.json().await?;
+    let data: Value = response_to_json(res).await?;
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
     }

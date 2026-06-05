@@ -111,7 +111,7 @@ fn prepare_embeddings(self_: &GeminiClient, data: &EmbeddingsData) -> Result<Req
 async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
     let res = builder.send().await?;
     let status = res.status();
-    let data: Value = res.json().await?;
+    let data: Value = response_to_json(res).await?;
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
     }

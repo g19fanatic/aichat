@@ -186,7 +186,7 @@ pub async fn gemini_chat_completions(
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
-    let data: Value = res.json().await?;
+    let data: Value = response_to_json(res).await?;
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
     }
@@ -202,7 +202,7 @@ pub async fn gemini_chat_completions_streaming(
     let res = builder.send().await?;
     let status = res.status();
     if !status.is_success() {
-        let data: Value = res.json().await?;
+        let data: Value = response_to_json(res).await?;
         catch_error(&data, status.as_u16())?;
     } else {
         let handle = |value: &str| -> Result<()> {
@@ -239,7 +239,7 @@ pub async fn gemini_chat_completions_streaming(
 async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
     let res = builder.send().await?;
     let status = res.status();
-    let data: Value = res.json().await?;
+    let data: Value = response_to_json(res).await?;
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
     }

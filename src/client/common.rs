@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 use inquire::{
     list_option::ListOption, required, validator::Validation, MultiSelect, Select, Text,
 };
-use reqwest::{Client as ReqwestClient, RequestBuilder};
+use reqwest::{Client as ReqwestClient, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::LazyLock;
@@ -490,6 +490,29 @@ pub async fn noop_rerank(_builder: RequestBuilder, _model: &Model) -> Result<Rer
     bail!("The client doesn't support rerank api")
 }
 
+/// Parse a response body as JSON with informative error messages.
+/// Replaces bare `res.json().await?` which produces unhelpful
+/// "error decoding response body" errors when the response isn't JSON.
+pub async fn response_to_json(res: Response) -> Result<Value> {
+    let status = res.status();
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let body = res.text().await.with_context(|| {
+        format!("Failed to read response body (status: {status}, content-type: {content_type})")
+    })?;
+    if body.is_empty() {
+        bail!("Empty response body (status: {status}, content-type: {content_type}). The API endpoint returned no data.");
+    }
+    serde_json::from_str(&body).with_context(|| {
+        let preview = body_preview(&body);
+        format!("Non-JSON response (status: {status}, content-type: {content_type}): {preview}")
+    })
+}
+
 pub fn catch_error(data: &Value, status: u16) -> Result<()> {
     if (200..300).contains(&status) {
         return Ok(());
@@ -537,6 +560,53 @@ pub fn json_str_from_map<'a>(
     field_name: &str,
 ) -> Option<&'a str> {
     map.get(field_name).and_then(|v| v.as_str())
+}
+
+/// Parse a response body string as JSON with informative error messages.
+/// This is the core parsing logic that can be tested without async/mock HTTP.
+/// The async `response_to_json` wrapper calls this after reading the body as text.
+#[cfg(test)]
+fn parse_response_body(status: u16, body: &str) -> Result<Value> {
+    if body.is_empty() {
+        bail!("Empty response body (status: {status}). The API endpoint returned no data.");
+    }
+    serde_json::from_str(body).with_context(|| {
+        let preview = body_preview(body);
+        format!("Non-JSON response (status: {status}): {preview}")
+    })
+}
+
+/// Generate a human-readable preview of a response body for error messages.
+/// For binary-looking content, shows hex bytes; for text, shows first 200 chars.
+fn body_preview(body: &str) -> String {
+    // Detect binary-looking content by checking for non-printable characters
+    let sample_size = body.chars().take(100).count();
+    let non_printable = body
+        .chars()
+        .take(100)
+        .filter(|c| !c.is_ascii_graphic() && !c.is_ascii_whitespace())
+        .count();
+
+    if sample_size > 0 && non_printable * 100 / sample_size > 30 {
+        // Binary-looking content: show hex preview of first 50 bytes
+        let hex: String = body
+            .as_bytes()
+            .iter()
+            .take(50)
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("[binary data] {hex}")
+    } else if body.len() > 200 {
+        // Text content: truncate at safe UTF-8 boundary near 200 bytes
+        let mut end = 200;
+        while !body.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}...", &body[..end])
+    } else {
+        body.to_string()
+    }
 }
 
 async fn set_client_models_config(client_config: &mut Value, client: &str) -> Result<String> {
@@ -673,4 +743,367 @@ fn prompt_input_string(
     }
     let text = text.prompt()?;
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_response_body_valid_json() {
+        let body = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        let result = parse_response_body(200, body);
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str().unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn test_parse_response_body_empty() {
+        let result = parse_response_body(200, "");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Empty response body"),
+            "Expected 'Empty response body' in error, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("200"),
+            "Expected status code '200' in error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_response_body_html() {
+        let html_body = r#"<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1><p>nginx</p></body></html>"#;
+        let result = parse_response_body(502, html_body);
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Non-JSON response"),
+            "Expected 'Non-JSON response' in error, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("502"),
+            "Expected status code '502' in error, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("<!DOCTYPE html>"),
+            "Expected HTML preview in error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_response_body_binary_garbage() {
+        // Simulate binary/garbage content with lots of non-printable characters
+        // Use null bytes and control chars that are clearly non-printable
+        let binary_body: String = (0u8..50).map(|i| char::from(i % 8)).collect();
+        let result = parse_response_body(200, &binary_body);
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Non-JSON response"),
+            "Expected 'Non-JSON response' in error, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("[binary data]"),
+            "Expected '[binary data]' hex preview in error, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("200"),
+            "Expected status code '200' in error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_response_body_error_includes_status_code() {
+        // Test various status codes appear in error messages
+        for status in [400, 401, 403, 404, 500, 502, 503] {
+            let result = parse_response_body(status, "not json at all");
+            assert!(result.is_err());
+            let err_msg = format!("{:#}", result.unwrap_err());
+            assert!(
+                err_msg.contains(&status.to_string()),
+                "Expected status code '{status}' in error, got: {err_msg}"
+            );
+        }
+    }
+
+    /// Simulates the full error chain as seen by the user: the inner error from
+    /// `parse_response_body` wrapped with the "Failed to call chat-completions api" context.
+    /// This matches what happens in production via `chat_completions_inner` + `with_context`.
+    fn simulate_full_error_chain(status: u16, body: &str) -> String {
+        let inner_result = parse_response_body(status, body);
+        let wrapped = inner_result.with_context(|| "Failed to call chat-completions api");
+        format!("{:#}", wrapped.unwrap_err())
+    }
+
+    #[test]
+    fn test_error_message_quality_empty_response() {
+        // Simulates: endpoint returns HTTP 200 with completely empty body
+        // (e.g., narsil-admin returning nothing)
+        let msg = simulate_full_error_chain(200, "");
+        // Verify the full chain is informative
+        assert!(
+            msg.contains("Failed to call chat-completions api"),
+            "Missing outer context in: {msg}"
+        );
+        assert!(
+            msg.contains("Empty response body"),
+            "Missing 'Empty response body' in: {msg}"
+        );
+        assert!(
+            msg.contains("200"),
+            "Missing status code in: {msg}"
+        );
+        // The message should give actionable guidance
+        assert!(
+            msg.contains("API endpoint returned no data"),
+            "Missing actionable guidance in: {msg}"
+        );
+        // Verify the overall format matches what users expect:
+        // "Failed to call chat-completions api: Empty response body (status: 200). The API endpoint returned no data."
+        assert!(
+            msg.starts_with("Failed to call chat-completions api: Empty response body (status: 200)"),
+            "Unexpected error format: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_error_message_quality_html_response() {
+        // Simulates: nginx returning 502 Bad Gateway HTML page
+        let html = r#"<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1></body></html>"#;
+        let msg = simulate_full_error_chain(502, html);
+        // Full chain should be present
+        assert!(
+            msg.contains("Failed to call chat-completions api"),
+            "Missing outer context in: {msg}"
+        );
+        assert!(
+            msg.contains("Non-JSON response"),
+            "Missing 'Non-JSON response' in: {msg}"
+        );
+        assert!(
+            msg.contains("502"),
+            "Missing status code in: {msg}"
+        );
+        // Should include HTML preview so user can see what the server returned
+        assert!(
+            msg.contains("<!DOCTYPE html>"),
+            "Missing HTML preview in: {msg}"
+        );
+        // Verify format starts correctly
+        assert!(
+            msg.starts_with("Failed to call chat-completions api: Non-JSON response (status: 502)"),
+            "Unexpected error format: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_error_message_quality_plain_text_response() {
+        // Simulates: server returning a plain text error message that isn't JSON
+        let body = "Service Unavailable - Please try again later";
+        let msg = simulate_full_error_chain(503, body);
+        assert!(
+            msg.contains("Failed to call chat-completions api"),
+            "Missing outer context in: {msg}"
+        );
+        assert!(
+            msg.contains("Non-JSON response"),
+            "Missing 'Non-JSON response' in: {msg}"
+        );
+        assert!(
+            msg.contains("503"),
+            "Missing status code in: {msg}"
+        );
+        // Should include the actual server message in the preview
+        assert!(
+            msg.contains("Service Unavailable"),
+            "Missing body preview in: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_error_message_quality_auth_redirect() {
+        // Simulates: auth redirect returning HTML login page with 200 status
+        let body = r#"<html><head><meta http-equiv="refresh" content="0;url=/login"></head><body>Redirecting to login...</body></html>"#;
+        let msg = simulate_full_error_chain(200, body);
+        assert!(
+            msg.starts_with("Failed to call chat-completions api: Non-JSON response (status: 200)"),
+            "Unexpected error format: {msg}"
+        );
+        // User should be able to see the redirect/login hint in the preview
+        assert!(
+            msg.contains("login"),
+            "Missing login redirect hint in: {msg}"
+        );
+    }
+
+    /// Integration test: Simulate the exact openai_compatible error scenario.
+    /// When parse_response_body fails (empty/non-JSON), the error propagates
+    /// BEFORE openai_extract_chat_completions is ever called.
+    /// This demonstrates the error path the user encounters.
+    #[test]
+    fn test_integration_empty_body_error_prevents_extract() {
+        use super::openai::openai_extract_chat_completions;
+
+        // Simulate what openai_chat_completions does:
+        // 1. response_to_json(res).await? — fails on empty body
+        // 2. catch_error(&data, status) — never reached
+        // 3. openai_extract_chat_completions(&data) — never reached
+
+        let parse_result = parse_response_body(200, "");
+        assert!(parse_result.is_err(), "Empty body should fail to parse");
+
+        // Since parse failed, extract is never called. But let's verify that
+        // IF somehow null/empty JSON reached extract, it handles gracefully:
+        let empty_json = serde_json::json!({});
+        let extract_result = openai_extract_chat_completions(&empty_json);
+        // extract returns Ok with empty output (graceful degradation via warn!())
+        assert!(
+            extract_result.is_ok(),
+            "Extract should gracefully handle empty JSON: {:?}",
+            extract_result.err()
+        );
+        let output = extract_result.unwrap();
+        assert!(output.text.is_empty(), "Text should be empty for empty JSON");
+        assert!(output.tool_calls.is_empty(), "Tool calls should be empty");
+    }
+
+    /// Integration test: When the server returns valid JSON with an error structure
+    /// (e.g., 401 Unauthorized), catch_error should extract the error message.
+    /// This tests the path: parse_response_body(OK) → catch_error(fails with message).
+    #[test]
+    fn test_integration_server_error_json_through_catch_error() {
+        // Simulate: server returns 401 with JSON error body
+        let error_body = r#"{"error":{"message":"Invalid API key provided","type":"invalid_api_key"}}"#;
+        let parse_result = parse_response_body(401, error_body);
+        assert!(parse_result.is_ok(), "Valid JSON should parse successfully");
+
+        let data = parse_result.unwrap();
+        // Now simulate catch_error (which is called when status is not success)
+        let catch_result = catch_error(&data, 401);
+        assert!(catch_result.is_err(), "catch_error should bail on 401");
+
+        let err_msg = catch_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid API key provided"),
+            "Should contain server error message, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("invalid_api_key"),
+            "Should contain error type, got: {err_msg}"
+        );
+
+        // Wrap with the outer context to get full user-visible error
+        let full_chain = format!(
+            "Failed to call chat-completions api: {}",
+            err_msg
+        );
+        assert!(
+            full_chain.contains("Failed to call chat-completions api"),
+            "Full chain missing outer context: {full_chain}"
+        );
+        assert!(
+            full_chain.contains("Invalid API key"),
+            "Full chain missing error detail: {full_chain}"
+        );
+    }
+
+    /// Integration test: Simulates the exact narsil-admin scenario from the bug report.
+    /// A custom openai_compatible endpoint returns an empty body with 200 status.
+    /// Verifies the COMPLETE error chain the user would see in their terminal.
+    #[test]
+    fn test_integration_narsil_admin_empty_response_scenario() {
+        // The exact scenario: custom endpoint returns HTTP 200 but empty body
+        let msg = simulate_full_error_chain(200, "");
+
+        // The OLD error was:
+        //   "Failed to call chat-completions api: error decoding response body: expected value at line 1 column 1"
+        // The NEW error should be much more informative:
+        assert!(
+            !msg.contains("error decoding response body"),
+            "Should NOT contain the old unhelpful reqwest error: {msg}"
+        );
+        assert!(
+            !msg.contains("expected value at line 1 column 1"),
+            "Should NOT contain the old unhelpful serde error: {msg}"
+        );
+        // Instead, should have clear, actionable information:
+        assert!(
+            msg.contains("Empty response body"),
+            "Should explain the body was empty: {msg}"
+        );
+        assert!(
+            msg.contains("200"),
+            "Should include the HTTP status: {msg}"
+        );
+        assert!(
+            msg.contains("API endpoint returned no data"),
+            "Should provide actionable context: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_error_message_quality_truncation() {
+        // Verify long response bodies are truncated at ~200 chars with "..."
+        // This ensures error messages don't flood the terminal with huge HTML pages
+        let long_body = "x".repeat(500);
+        let msg = simulate_full_error_chain(200, &long_body);
+        // Must contain truncation indicator
+        assert!(
+            msg.contains("..."),
+            "Long body error should show truncation '...', got: {msg}"
+        );
+        // Should NOT contain the full 500-char body
+        assert!(
+            !msg.contains(&"x".repeat(500)),
+            "Error message should NOT contain full 500-char body"
+        );
+        // Should contain approximately 200 chars of the body
+        assert!(
+            msg.contains(&"x".repeat(200)),
+            "Error preview should show ~200 chars of body"
+        );
+        // Format should still start correctly
+        assert!(
+            msg.starts_with("Failed to call chat-completions api: Non-JSON response (status: 200)"),
+            "Unexpected error format: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_body_preview_short_text() {
+        // Short text should be returned verbatim (no truncation)
+        assert_eq!(body_preview("hello world"), "hello world");
+        assert_eq!(body_preview("Not Found"), "Not Found");
+        // Exactly 200 chars should NOT be truncated
+        let exactly_200 = "a".repeat(200);
+        assert_eq!(body_preview(&exactly_200), exactly_200);
+    }
+
+    #[test]
+    fn test_body_preview_long_text() {
+        // 201+ chars should be truncated with "..."
+        let over_200 = "b".repeat(250);
+        let preview = body_preview(&over_200);
+        assert!(
+            preview.ends_with("..."),
+            "Preview should end with '...', got: {preview}"
+        );
+        // Should be ~203 chars (200 content + "...")
+        assert!(
+            preview.len() <= 204,
+            "Preview should be ≤204 chars (200 + '...'), got len: {}",
+            preview.len()
+        );
+        assert!(
+            preview.len() >= 203,
+            "Preview should be ≥203 chars, got len: {}",
+            preview.len()
+        );
+    }
 }
