@@ -74,9 +74,19 @@ impl Input {
         .await
         .context("Failed to load files")?;
         let mut texts = vec![];
-        if !raw_text.is_empty() {
-            texts.push(raw_text.to_string());
-        };
+        // Documents first (static content — cache-friendly prefix)
+        let documents_is_empty = documents.is_empty();
+        let documents_len = documents.len();
+        for (kind, path, contents) in documents {
+            if documents_len == 1 && raw_text.is_empty() {
+                texts.push(format!("\n{contents}"));
+            } else {
+                texts.push(format!(
+                    "\n============ {kind}: {path} ============\n{contents}"
+                ));
+            }
+        }
+        // Last reply (semi-static — stable per session turn)
         if with_last_reply {
             if let Some(LastMessage { input, output, .. }) = config.read().last_message.as_ref() {
                 if !output.is_empty() {
@@ -88,19 +98,13 @@ impl Input {
                     texts.push(format!("\n{v}"));
                 }
             }
-            if last_reply.is_none() && documents.is_empty() && medias.is_empty() {
+            if last_reply.is_none() && documents_is_empty && medias.is_empty() {
                 bail!("No last reply found");
             }
         }
-        let documents_len = documents.len();
-        for (kind, path, contents) in documents {
-            if documents_len == 1 && raw_text.is_empty() {
-                texts.push(format!("\n{contents}"));
-            } else {
-                texts.push(format!(
-                    "\n============ {kind}: {path} ============\n{contents}"
-                ));
-            }
+        // Prompt text last (dynamic content — changes every request)
+        if !raw_text.is_empty() {
+            texts.push(raw_text.to_string());
         }
         let (role, with_session, with_agent) = resolve_role(&config.read(), role);
         Ok(Self {
