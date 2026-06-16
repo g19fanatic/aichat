@@ -82,7 +82,7 @@ impl Input {
                 texts.push(format!("\n{contents}"));
             } else {
                 texts.push(format!(
-                    "\n============ {kind}: {path} ============\n{contents}"
+                    "\n{contents}\n============ {kind}: {path} ============"
                 ));
             }
         }
