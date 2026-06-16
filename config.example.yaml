@@ -119,6 +119,17 @@ clients:
     api_key: xxx
     organization_id: org-xxx                          # Optional
 
+  # Example: Using a command to dynamically retrieve the API key
+  # Use `api_key_command` to run a shell command that outputs the key to stdout.
+  # This is useful for fetching keys from secret managers (e.g., 1Password, Vault, aws-cli).
+  # The result is cached for `api_key_command_expires_in` seconds (default: 3600).
+  # - type: openai
+  #   api_base: https://api.openai.com/v1
+  #   api_key_command: op read "op://Vault/OpenAI/api-key"
+  #   api_key_command_expires_in: 1800                # Cache the key for 30 minutes
+  #   organization_id: org-xxx                        # Optional
+  #   # Note: If both `api_key` and `api_key_command` are set, `api_key` takes precedence.
+
   # For any platform compatible with OpenAI's API
   - type: openai-compatible
     name: ollama

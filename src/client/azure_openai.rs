@@ -9,6 +9,8 @@ pub struct AzureOpenAIConfig {
     pub name: Option<String>,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
+    pub api_key_command: Option<String>,
+    pub api_key_command_expires_in: Option<u64>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -45,7 +47,7 @@ fn prepare_chat_completions(
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
     let api_base = self_.get_api_base()?;
-    let api_key = self_.get_api_key()?;
+    let api_key = resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in)?;
 
     let url = format!(
         "{}/openai/deployments/{}/chat/completions?api-version=2024-12-01-preview",
@@ -64,7 +66,7 @@ fn prepare_chat_completions(
 
 fn prepare_embeddings(self_: &AzureOpenAIClient, data: &EmbeddingsData) -> Result<RequestData> {
     let api_base = self_.get_api_base()?;
-    let api_key = self_.get_api_key()?;
+    let api_key = resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in)?;
 
     let url = format!(
         "{}/openai/deployments/{}/embeddings?api-version=2024-10-21",

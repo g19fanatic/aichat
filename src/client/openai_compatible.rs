@@ -11,6 +11,8 @@ pub struct OpenAICompatibleConfig {
     pub name: Option<String>,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
+    pub api_key_command: Option<String>,
+    pub api_key_command_expires_in: Option<u64>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -39,7 +41,7 @@ fn prepare_chat_completions(
     self_: &OpenAICompatibleClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
-    let api_key = self_.get_api_key().ok();
+    let api_key = resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in).ok();
     let api_base = get_api_base_ext(self_)?;
 
     let url = format!("{api_base}/chat/completions");
@@ -59,7 +61,7 @@ fn prepare_embeddings(
     self_: &OpenAICompatibleClient,
     data: &EmbeddingsData,
 ) -> Result<RequestData> {
-    let api_key = self_.get_api_key().ok();
+    let api_key = resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in).ok();
     let api_base = get_api_base_ext(self_)?;
 
     let url = format!("{api_base}/embeddings");
@@ -76,7 +78,7 @@ fn prepare_embeddings(
 }
 
 fn prepare_rerank(self_: &OpenAICompatibleClient, data: &RerankData) -> Result<RequestData> {
-    let api_key = self_.get_api_key().ok();
+    let api_key = resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in).ok();
     let api_base = get_api_base_ext(self_)?;
 
     let url = if self_.name().starts_with("ernie") {

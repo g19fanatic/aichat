@@ -1,4 +1,5 @@
 mod access_token;
+mod api_key_command;
 mod common;
 mod message;
 #[macro_use]
@@ -10,6 +11,7 @@ pub use crate::function::ToolCall;
 pub use common::*;
 pub use message::*;
 pub use model::*;
+pub use self::api_key_command::resolve_api_key;
 pub use stream::*;
 
 register_client!(
