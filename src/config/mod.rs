@@ -145,6 +145,7 @@ pub struct Config {
     pub user_agent: Option<String>,
     pub save_shell_history: bool,
     pub sync_models_url: Option<String>,
+    pub show_gateway_info: Option<bool>,
 
     pub clients: Vec<ClientConfig>,
 
@@ -219,6 +220,7 @@ impl Default for Config {
             serve_addr: None,
             user_agent: None,
             save_shell_history: true,
+            show_gateway_info: None,
             sync_models_url: None,
 
             clients: vec![],
@@ -2377,6 +2379,9 @@ impl Config {
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("sync_models_url")) {
             self.sync_models_url = v;
+        }
+        if let Some(v) = read_env_bool(&get_env_name("show_gateway_info")) {
+            self.show_gateway_info = v;
         }
     }
 

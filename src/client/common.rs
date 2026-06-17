@@ -337,6 +337,7 @@ pub struct ChatCompletionsOutput {
     pub id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub extra: Option<Value>,
 }
 
 impl ChatCompletionsOutput {
@@ -466,8 +467,34 @@ pub async fn call_chat_completions(
             let ChatCompletionsOutput {
                 mut text,
                 tool_calls,
+                extra,
                 ..
             } = ret;
+            let show_gateway_info = client
+                .global_config()
+                .read()
+                .show_gateway_info
+                .unwrap_or(false);
+            if let Some(extra) = &extra {
+                if show_gateway_info {
+                    if let Some(cache_debug) = extra.get("cache_debug") {
+                        if let Some(cache_hit) =
+                            cache_debug.get("cache_hit").and_then(|v| v.as_bool())
+                        {
+                        let status = if cache_hit { "HIT" } else { "MISS" };
+                        let hit_type = cache_debug
+                            .get("hit_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let cache_id = cache_debug
+                            .get("cache_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        eprintln!("⚡ Bifrost cache {status} ({hit_type}) [{cache_id}]");
+                        }
+                    }
+                }
+            }
             if !text.is_empty() {
                 if extract_code {
                     text = extract_code_block(&strip_think_tag(&text)).to_string();

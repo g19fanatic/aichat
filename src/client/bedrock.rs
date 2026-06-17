@@ -688,6 +688,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         id: None,
         input_tokens: data["usage"]["inputTokens"].as_u64(),
         output_tokens: data["usage"]["outputTokens"].as_u64(),
+        extra: None,
     };
     Ok(output)
 }
@@ -988,6 +989,7 @@ async fn responses_api_chat_completions(
             id: data["id"].as_str().map(|s| s.to_string()),
             input_tokens: data["usage"]["input_tokens"].as_u64(),
             output_tokens: data["usage"]["output_tokens"].as_u64(),
+            extra: data.get("extra_fields").cloned(),
         });
     }
 
@@ -997,6 +999,7 @@ async fn responses_api_chat_completions(
         id: data["id"].as_str().map(|s| s.to_string()),
         input_tokens: data["usage"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["output_tokens"].as_u64(),
+        extra: data.get("extra_fields").cloned(),
     };
     Ok(output)
 }

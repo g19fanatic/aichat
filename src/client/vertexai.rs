@@ -302,6 +302,7 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
         id: None,
         input_tokens: data["usageMetadata"]["promptTokenCount"].as_u64(),
         output_tokens: data["usageMetadata"]["candidatesTokenCount"].as_u64(),
+        extra: None,
     };
     Ok(output)
 }

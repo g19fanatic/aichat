@@ -252,6 +252,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["billed_units"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["billed_units"]["output_tokens"].as_u64(),
+        extra: None,
     };
     Ok(output)
 }

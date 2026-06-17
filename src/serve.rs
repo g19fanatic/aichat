@@ -785,7 +785,7 @@ fn ret_non_stream(id: &str, model: &str, created: i64, output: &ChatCompletionsO
             "finish_reason": "tool_calls",
         })
     };
-    let res_body = json!({
+    let mut res_body = json!({
         "id": id,
         "object": "chat.completion",
         "created": created,
@@ -797,6 +797,9 @@ fn ret_non_stream(id: &str, model: &str, created: i64, output: &ChatCompletionsO
             "total_tokens": total_tokens,
         },
     });
+    if let (Some(extra), Some(obj)) = (output.extra.as_ref(), res_body.as_object_mut()) {
+        obj.insert("extra_fields".to_string(), extra.clone());
+    }
     Bytes::from(res_body.to_string())
 }
 
