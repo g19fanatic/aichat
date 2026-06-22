@@ -56,8 +56,39 @@ pub fn resolve_api_key(
         return get_access_token(client_name);
     }
 
-    // 4. Execute command
-    let token = run_api_key_command(cmd)?;
+    // 4. Execute command with retry (3 attempts, 200ms delay)
+    let token = {
+        let mut last_err = anyhow!("api_key_command failed after 3 attempts");
+        let mut success = None;
+        for attempt in 1..=3u32 {
+            match run_api_key_command(cmd) {
+                Ok(t) => {
+                    success = Some(t);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[aichat:warn] api_key_command for '{}': attempt {}/3 failed: {}",
+                        client_name, attempt, e
+                    );
+                    last_err = e;
+                    if attempt < 3 {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+            }
+        }
+        match success {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "[aichat:warn] api_key_command for '{}': all 3 attempts exhausted, giving up",
+                    client_name
+                );
+                return Err(last_err);
+            }
+        }
+    };
 
     // 5. Cache with expiry
     let expires_in_secs = expires_in.map(|v| v as i64).unwrap_or(DEFAULT_EXPIRES_IN);

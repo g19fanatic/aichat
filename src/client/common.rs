@@ -584,14 +584,18 @@ pub async fn response_to_json(res: Response) -> Result<Value> {
     })
 }
 
-/// Check if an error represents a retriable HTTP gateway error (502/504).
-/// Matches against the error message format produced by `response_to_json()`.
+/// Check if an error represents a retriable error (gateway 502/504 or auth failures).
+/// Matches against the error message format produced by `response_to_json()`
+/// and authentication/API key acquisition errors.
 pub fn is_retriable_error(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
     msg.contains("status: 504 Gateway")
         || msg.contains("status: 502 Bad Gateway")
         || (msg.contains("status: 504") && msg.contains("Empty response body"))
         || (msg.contains("status: 502") && msg.contains("Empty response body"))
+        || msg.contains("status: 401")
+        || msg.contains("authorization header required")
+        || msg.contains("Failed to acquire API key")
 }
 
 pub fn catch_error(data: &Value, status: u16) -> Result<()> {
@@ -1207,7 +1211,7 @@ mod tests {
     #[test]
     fn test_is_retriable_error_non_retriable() {
         let err = anyhow::anyhow!(
-            "Non-JSON response (status: 401 Unauthorized, content-type: text/html): <html>..."
+            "Non-JSON response (status: 403 Forbidden, content-type: text/html): <html>..."
         );
         assert!(!is_retriable_error(&err));
     }
@@ -1224,5 +1228,35 @@ mod tests {
             "Empty response body (status: 504, content-type: unknown). The API endpoint returned no data."
         );
         assert!(is_retriable_error(&err), "Empty body 504 should be retriable");
+    }
+
+    #[test]
+    fn test_is_retriable_error_401() {
+        let err = anyhow::anyhow!(
+            "Non-JSON response (status: 401 Unauthorized, content-type: text/html): <html>..."
+        );
+        assert!(is_retriable_error(&err), "401 Unauthorized should be retriable");
+    }
+
+    #[test]
+    fn test_is_retriable_error_auth_header_required() {
+        let err = anyhow::anyhow!(
+            "authorization header required"
+        );
+        assert!(
+            is_retriable_error(&err),
+            "Auth header required error should be retriable"
+        );
+    }
+
+    #[test]
+    fn test_is_retriable_error_failed_api_key() {
+        let err = anyhow::anyhow!(
+            "Failed to acquire API key: command exited with status 1"
+        );
+        assert!(
+            is_retriable_error(&err),
+            "Failed to acquire API key should be retriable"
+        );
     }
 }

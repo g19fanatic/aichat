@@ -41,7 +41,14 @@ fn prepare_chat_completions(
     self_: &OpenAICompatibleClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
-    let api_key = resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in).ok();
+    let api_key = if self_.config.api_key_command.is_some() {
+        Some(resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in)?)
+    } else {
+        resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in).ok()
+    };
+    if api_key.is_none() {
+        eprintln!("[aichat:info] {}: no api_key configured, proceeding without auth", self_.name());
+    }
     let api_base = get_api_base_ext(self_)?;
 
     let url = format!("{api_base}/chat/completions");
@@ -61,7 +68,14 @@ fn prepare_embeddings(
     self_: &OpenAICompatibleClient,
     data: &EmbeddingsData,
 ) -> Result<RequestData> {
-    let api_key = resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in).ok();
+    let api_key = if self_.config.api_key_command.is_some() {
+        Some(resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in)?)
+    } else {
+        resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in).ok()
+    };
+    if api_key.is_none() {
+        eprintln!("[aichat:info] {}: no api_key configured, proceeding without auth", self_.name());
+    }
     let api_base = get_api_base_ext(self_)?;
 
     let url = format!("{api_base}/embeddings");
@@ -78,7 +92,14 @@ fn prepare_embeddings(
 }
 
 fn prepare_rerank(self_: &OpenAICompatibleClient, data: &RerankData) -> Result<RequestData> {
-    let api_key = resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in).ok();
+    let api_key = if self_.config.api_key_command.is_some() {
+        Some(resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in)?)
+    } else {
+        resolve_api_key(self_.name(), self_.get_api_key(), self_.config.api_key_command.as_deref(), self_.config.api_key_command_expires_in).ok()
+    };
+    if api_key.is_none() {
+        eprintln!("[aichat:info] {}: no api_key configured, proceeding without auth", self_.name());
+    }
     let api_base = get_api_base_ext(self_)?;
 
     let url = if self_.name().starts_with("ernie") {
