@@ -28,18 +28,6 @@ pub struct VimHistoryTurn {
     pub assistant: String,
 }
 
-/// Parsed cache hints from vim-llm-assistant's `_cache_hints` JSON field.
-/// Tells aichat where to place cache breakpoints when building content blocks.
-#[derive(Debug, Clone, Default)]
-pub struct CacheHints {
-    /// Field names after which a cache breakpoint should be placed
-    pub breakpoint_after: Vec<String>,
-    /// Fields that rarely change between requests (informational)
-    pub stable_fields: Vec<String>,
-    /// Fields that change every request (informational)
-    pub dynamic_fields: Vec<String>,
-}
-
 /// A content block from the split user message, annotated with cache metadata.
 /// When `_cache_hints` is present in the JSON input, the user message text is split
 /// into separate content blocks at field boundaries. Each block can independently
@@ -47,7 +35,8 @@ pub struct CacheHints {
 #[derive(Debug, Clone)]
 pub struct CacheContentBlock {
     /// The field name this block corresponds to (e.g., "buffers", "active_buffer")
-    pub field_name: String,
+    #[allow(dead_code)] // Used in tests for parsing validation
+    pub(crate) field_name: String,
     /// The text content of this block
     pub text: String,
     /// Whether a cache breakpoint should be placed after this block
@@ -281,22 +270,6 @@ impl Input {
 
     pub fn rag_name(&self) -> Option<&str> {
         self.rag_name.as_deref()
-    }
-
-    /// Returns parsed vim history turns (from vim-llm-assistant's llm_history_turns JSON field).
-    pub fn vim_history_turns(&self) -> &[VimHistoryTurn] {
-        &self.vim_history_turns
-    }
-
-    /// Returns parsed cache content blocks (from vim-llm-assistant's _cache_hints JSON field).
-    pub fn cache_content_blocks(&self) -> &[CacheContentBlock] {
-        &self.cache_content_blocks
-    }
-
-    /// Returns true if this request is a cache warming request (max_tokens will be set to 1).
-    /// Detected from `_cache_warm` field in JSON input or `AICHAT_CACHE_WARM=1` env var.
-    pub fn is_cache_warm(&self) -> bool {
-        self.cache_warm
     }
 
     pub fn merge_tool_results(mut self, output: String, tool_results: Vec<ToolResult>) -> Self {
