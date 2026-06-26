@@ -232,6 +232,8 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         top_p,
         functions,
         stream,
+        cache_content_blocks: _,
+        cache_warm: _,
     } = data;
 
     let messages_len = messages.len();
@@ -354,6 +356,12 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         let should_cache = has_multi_messages || has_tools;
 
         if should_cache {
+            // Add cache_control to last tool for tool-level caching
+            if let Some(tools_arr) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                if let Some(last_tool) = tools_arr.last_mut() {
+                    last_tool["cache_control"] = json!({"type": "ephemeral"});
+                }
+            }
             if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
                 // Add cache_control to system message if present
                 if let Some(system_msg) = messages.iter_mut().find(|m| m["role"] == "system") {

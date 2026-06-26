@@ -9,11 +9,50 @@ use crate::utils::{base64_encode, is_loader_protocol, sha256, AbortSignal};
 
 use anyhow::{bail, Context, Result};
 use indexmap::IndexSet;
+use serde_json::Value;
 use std::{collections::HashMap, fs::File, io::Read};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
 const SUMMARY_MAX_WIDTH: usize = 80;
+
+/// Maximum characters per history turn field (user or assistant).
+/// Truncates to prevent blowing out the context window with pathologically long turns.
+const MAX_HISTORY_TURN_CHARS: usize = 16000;
+
+/// A parsed history turn from vim-llm-assistant's llm_history_turns JSON array.
+/// Each turn represents one user/assistant exchange from the conversation history.
+#[derive(Debug, Clone)]
+pub struct VimHistoryTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
+/// Parsed cache hints from vim-llm-assistant's `_cache_hints` JSON field.
+/// Tells aichat where to place cache breakpoints when building content blocks.
+#[derive(Debug, Clone, Default)]
+pub struct CacheHints {
+    /// Field names after which a cache breakpoint should be placed
+    pub breakpoint_after: Vec<String>,
+    /// Fields that rarely change between requests (informational)
+    pub stable_fields: Vec<String>,
+    /// Fields that change every request (informational)
+    pub dynamic_fields: Vec<String>,
+}
+
+/// A content block from the split user message, annotated with cache metadata.
+/// When `_cache_hints` is present in the JSON input, the user message text is split
+/// into separate content blocks at field boundaries. Each block can independently
+/// receive `cache_control` in the Claude API request.
+#[derive(Debug, Clone)]
+pub struct CacheContentBlock {
+    /// The field name this block corresponds to (e.g., "buffers", "active_buffer")
+    pub field_name: String,
+    /// The text content of this block
+    pub text: String,
+    /// Whether a cache breakpoint should be placed after this block
+    pub is_breakpoint: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct Input {
@@ -29,6 +68,9 @@ pub struct Input {
     tool_calls: Option<MessageContentToolCalls>,
     role: Role,
     rag_name: Option<String>,
+    vim_history_turns: Vec<VimHistoryTurn>,
+    cache_content_blocks: Vec<CacheContentBlock>,
+    cache_warm: bool,
     with_session: bool,
     with_agent: bool,
 }
@@ -49,6 +91,9 @@ impl Input {
             tool_calls: None,
             role,
             rag_name: None,
+            vim_history_turns: vec![],
+            cache_content_blocks: vec![],
+            cache_warm: false,
             with_session,
             with_agent,
         }
@@ -77,6 +122,18 @@ impl Input {
         // Documents first (static content — cache-friendly prefix)
         let documents_is_empty = documents.is_empty();
         let documents_len = documents.len();
+        // Try to parse vim history turns from loaded documents (JSON input from vim-llm-assistant)
+        let vim_history_turns = documents.iter()
+            .flat_map(|(_, _, contents)| parse_vim_history_turns(contents))
+            .collect::<Vec<_>>();
+        // Try to parse cache hints and split content into blocks for cache-aware message building
+        let cache_content_blocks = documents.iter()
+            .flat_map(|(_, _, contents)| split_json_content_blocks(contents))
+            .collect::<Vec<_>>();
+        // Detect cache warm flag from _cache_warm field in JSON input or AICHAT_CACHE_WARM env var
+        let cache_warm = documents.iter()
+            .any(|(_, _, contents)| detect_cache_warm_field(contents))
+            || std::env::var("AICHAT_CACHE_WARM").ok().as_deref() == Some("1");
         for (kind, path, contents) in documents {
             if documents_len == 1 && raw_text.is_empty() {
                 texts.push(format!("\n{contents}"));
@@ -106,6 +163,16 @@ impl Input {
         if !raw_text.is_empty() {
             texts.push(raw_text.to_string());
         }
+        // Append cursor position from env vars (volatile — placed AFTER all cached content)
+        // These are set by vim-llm-assistant adapter to avoid invalidating the JSON file cache
+        if let (Ok(cursor_line), Ok(cursor_col)) = (
+            std::env::var("AICHAT_CURSOR_LINE"),
+            std::env::var("AICHAT_CURSOR_COL"),
+        ) {
+            if !cursor_line.is_empty() && !cursor_col.is_empty() {
+                texts.push(format!("\ncursor_line:{}, cursor_col:{}", cursor_line, cursor_col));
+            }
+        }
         let (role, with_session, with_agent) = resolve_role(&config.read(), role);
         Ok(Self {
             config: config.clone(),
@@ -120,6 +187,9 @@ impl Input {
             tool_calls: Default::default(),
             role,
             rag_name: None,
+            vim_history_turns,
+            cache_content_blocks,
+            cache_warm,
             with_session,
             with_agent,
         })
@@ -213,6 +283,22 @@ impl Input {
         self.rag_name.as_deref()
     }
 
+    /// Returns parsed vim history turns (from vim-llm-assistant's llm_history_turns JSON field).
+    pub fn vim_history_turns(&self) -> &[VimHistoryTurn] {
+        &self.vim_history_turns
+    }
+
+    /// Returns parsed cache content blocks (from vim-llm-assistant's _cache_hints JSON field).
+    pub fn cache_content_blocks(&self) -> &[CacheContentBlock] {
+        &self.cache_content_blocks
+    }
+
+    /// Returns true if this request is a cache warming request (max_tokens will be set to 1).
+    /// Detected from `_cache_warm` field in JSON input or `AICHAT_CACHE_WARM=1` env var.
+    pub fn is_cache_warm(&self) -> bool {
+        self.cache_warm
+    }
+
     pub fn merge_tool_results(mut self, output: String, tool_results: Vec<ToolResult>) -> Self {
         match self.tool_calls.as_mut() {
             Some(exist_tool_results) => {
@@ -250,6 +336,8 @@ impl Input {
             top_p,
             functions,
             stream,
+            cache_content_blocks: self.cache_content_blocks.clone(),
+            cache_warm: self.cache_warm,
         })
     }
 
@@ -259,6 +347,31 @@ impl Input {
         } else {
             self.role().build_messages(self)
         };
+        // When vim history turns are present, prepend them as proper multi-turn
+        // user/assistant message pairs BEFORE the current user context message.
+        // This enables Anthropic's prompt caching to work at maximum efficiency:
+        // each turn is cached independently, so subsequent requests only pay for new content.
+        if !self.vim_history_turns.is_empty() {
+            if let Some(insert_pos) = messages.iter().rposition(|m| m.role == MessageRole::User) {
+                let mut history_messages = Vec::new();
+                for turn in &self.vim_history_turns {
+                    if !turn.user.is_empty() {
+                        history_messages.push(Message::new(
+                            MessageRole::User,
+                            MessageContent::Text(turn.user.clone()),
+                        ));
+                    }
+                    if !turn.assistant.is_empty() {
+                        history_messages.push(Message::new(
+                            MessageRole::Assistant,
+                            MessageContent::Text(turn.assistant.clone()),
+                        ));
+                    }
+                }
+                // Splice history turns before the last user message (current context)
+                messages.splice(insert_pos..insert_pos, history_messages);
+            }
+        }
         if let Some(tool_calls) = &self.tool_calls {
             messages.push(Message::new(
                 MessageRole::Assistant,
@@ -375,6 +488,182 @@ impl Input {
             }
             MessageContent::Array(list)
         }
+    }
+}
+
+/// Parse vim-llm-assistant's `llm_history_turns` array from JSON content.
+///
+/// Expects JSON with a top-level `llm_history_turns` array field, where each element
+/// has `user` (required) and `assistant` (optional) string fields.
+/// Returns empty Vec if the content is not JSON, has no `llm_history_turns` field,
+/// or if the field is empty/malformed.
+///
+/// Edge case handling:
+/// - Empty/whitespace-only user text: turn is skipped (no meaningful prompt)
+/// - Missing/null assistant: treated as empty string (turn in progress)
+/// - Extremely long content (>16000 chars): truncated with "(…truncated)" marker
+/// - Special characters (unicode, newlines, etc.): passed through unchanged
+/// - Non-string fields: turn is skipped
+/// - Numeric/boolean user/assistant values: turn is skipped (as_str returns None)
+/// - Empty turns array: returns empty Vec
+pub fn parse_vim_history_turns(content: &str) -> Vec<VimHistoryTurn> {
+    // Quick prefix check to avoid parsing non-JSON content
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return vec![];
+    }
+
+    let json: Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let turns_array = match json.get("llm_history_turns").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return vec![],
+    };
+
+    let mut turns = Vec::new();
+    for turn in turns_array {
+        // user field is required — skip turns without it
+        let user_raw = match turn.get("user").and_then(|v| v.as_str()) {
+            Some(s) if !s.trim().is_empty() => s,
+            None => continue,
+            Some(_) => continue, // empty/whitespace-only user — skip
+        };
+        // assistant field is optional — use empty string if missing (turn in progress)
+        let assistant_raw = turn.get("assistant")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Truncate overly long content to prevent context window exhaustion
+        let user = truncate_turn_content(user_raw);
+        let assistant = truncate_turn_content(assistant_raw);
+
+        turns.push(VimHistoryTurn { user, assistant });
+    }
+    turns
+}
+
+/// Truncate a turn's content if it exceeds MAX_HISTORY_TURN_CHARS.
+fn truncate_turn_content(text: &str) -> String {
+    if text.len() > MAX_HISTORY_TURN_CHARS {
+        let mut truncated = text[..MAX_HISTORY_TURN_CHARS].to_string();
+        truncated.push_str("\n(…truncated)");
+        truncated
+    } else {
+        text.to_string()
+    }
+}
+
+/// Parse `_cache_hints` from JSON content and split field values into content blocks.
+///
+/// Reads the top-level JSON object, extracts the `_cache_hints` field to determine
+/// which fields are breakpoints, then iterates over the remaining content fields
+/// in their JSON order to produce annotated content blocks.
+///
+/// Fields that are metadata (prefixed with `_`) or handled separately (like
+/// `llm_history_turns`) are excluded from the output blocks.
+///
+/// Returns empty Vec if:
+/// - Content is not JSON
+/// - JSON has no `_cache_hints` field
+/// - `_cache_hints.breakpoint_after` is missing or empty
+pub fn split_json_content_blocks(content: &str) -> Vec<CacheContentBlock> {
+    // Quick prefix check to avoid parsing non-JSON content
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return vec![];
+    }
+
+    let json: Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let obj = match json.as_object() {
+        Some(o) => o,
+        None => return vec![],
+    };
+
+    // Extract _cache_hints — if absent, no splitting is performed
+    let hints = match obj.get("_cache_hints") {
+        Some(h) => h,
+        None => return vec![],
+    };
+
+    let breakpoint_after: Vec<String> = hints
+        .get("breakpoint_after")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if breakpoint_after.is_empty() {
+        return vec![];
+    }
+
+    // Fields to skip — metadata or handled separately
+    let skip_fields = ["_cache_hints", "llm_history_turns"];
+
+    let mut blocks = Vec::new();
+
+    // Iterate over JSON object keys in their original order (serde_json Map preserves insertion order)
+    for (key, value) in obj.iter() {
+        if skip_fields.contains(&key.as_str()) || key.starts_with('_') {
+            continue;
+        }
+
+        // Format the field value as text content
+        let text = match value {
+            Value::String(s) => s.clone(),
+            Value::Null => continue, // skip null fields
+            _ => {
+                // For arrays/objects, serialize to compact JSON with a label
+                format!("{}:{}", key, value)
+            }
+        };
+
+        if text.is_empty() {
+            continue;
+        }
+
+        let is_breakpoint = breakpoint_after.contains(key);
+
+        blocks.push(CacheContentBlock {
+            field_name: key.clone(),
+            text,
+            is_breakpoint,
+        });
+    }
+
+    blocks
+}
+
+/// Detect `_cache_warm` field in JSON content.
+///
+/// Returns true if the JSON input has a truthy `_cache_warm` field.
+/// Accepts: `true`, `1`, `"1"`, `"true"` as truthy values.
+/// Returns false for non-JSON content or missing/falsy `_cache_warm` field.
+pub fn detect_cache_warm_field(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+
+    let json: Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    match json.get("_cache_warm") {
+        Some(Value::Bool(true)) => true,
+        Some(Value::Number(n)) => n.as_u64() == Some(1),
+        Some(Value::String(s)) => s == "1" || s == "true",
+        _ => false,
     }
 }
 
@@ -541,4 +830,262 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
     let data_url = format!("data:{mime_type};base64,{encoded_image}");
 
     Ok(data_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_vim_history_turns_normal() {
+        let json = r#"{"llm_history_turns": [
+            {"user": "Hello", "assistant": "Hi there!"},
+            {"user": "How are you?", "assistant": "I'm doing well."}
+        ]}"#;
+        let turns = parse_vim_history_turns(json);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].user, "Hello");
+        assert_eq!(turns[0].assistant, "Hi there!");
+        assert_eq!(turns[1].user, "How are you?");
+        assert_eq!(turns[1].assistant, "I'm doing well.");
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_empty_assistant() {
+        // Turn in progress — assistant hasn't responded yet
+        let json = r#"{"llm_history_turns": [
+            {"user": "Hello", "assistant": ""},
+            {"user": "Still waiting"}
+        ]}"#;
+        let turns = parse_vim_history_turns(json);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].user, "Hello");
+        assert_eq!(turns[0].assistant, "");
+        assert_eq!(turns[1].user, "Still waiting");
+        assert_eq!(turns[1].assistant, "");
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_null_assistant() {
+        let json = r#"{"llm_history_turns": [
+            {"user": "Hello", "assistant": null}
+        ]}"#;
+        let turns = parse_vim_history_turns(json);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "Hello");
+        assert_eq!(turns[0].assistant, "");
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_missing_user() {
+        // Turns without user field should be skipped entirely
+        let json = r#"{"llm_history_turns": [
+            {"assistant": "orphan response"},
+            {"user": "Valid turn", "assistant": "Valid response"}
+        ]}"#;
+        let turns = parse_vim_history_turns(json);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "Valid turn");
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_empty_user() {
+        // Empty/whitespace user should be skipped
+        let json = r#"{"llm_history_turns": [
+            {"user": "", "assistant": "response to nothing"},
+            {"user": "   ", "assistant": "response to whitespace"},
+            {"user": "\t\n", "assistant": "response to control chars"},
+            {"user": "Valid", "assistant": "OK"}
+        ]}"#;
+        let turns = parse_vim_history_turns(json);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "Valid");
+        assert_eq!(turns[0].assistant, "OK");
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_special_characters() {
+        let json = r#"{"llm_history_turns": [
+            {"user": "Hello 🌍 世界", "assistant": "こんにちは! 🎉"},
+            {"user": "Line1\nLine2\tTabbed", "assistant": "\"Quoted\" & <escaped>"},
+            {"user": "Back\\slash", "assistant": "Forward/slash"}
+        ]}"#;
+        let turns = parse_vim_history_turns(json);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].user, "Hello 🌍 世界");
+        assert_eq!(turns[0].assistant, "こんにちは! 🎉");
+        assert_eq!(turns[1].user, "Line1\nLine2\tTabbed");
+        assert_eq!(turns[1].assistant, "\"Quoted\" & <escaped>");
+        assert_eq!(turns[2].user, "Back\\slash");
+        assert_eq!(turns[2].assistant, "Forward/slash");
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_non_json() {
+        assert_eq!(parse_vim_history_turns("not json at all").len(), 0);
+        assert_eq!(parse_vim_history_turns("").len(), 0);
+        assert_eq!(parse_vim_history_turns("[1,2,3]").len(), 0);
+        assert_eq!(parse_vim_history_turns("plain text content").len(), 0);
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_no_field() {
+        let json = r#"{"other_field": "value", "prompt": "hello"}"#;
+        assert_eq!(parse_vim_history_turns(json).len(), 0);
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_empty_array() {
+        let json = r#"{"llm_history_turns": []}"#;
+        assert_eq!(parse_vim_history_turns(json).len(), 0);
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_non_string_values() {
+        // Numeric/boolean values for user/assistant should be handled gracefully
+        let json = r#"{"llm_history_turns": [
+            {"user": 42, "assistant": "response"},
+            {"user": true, "assistant": "response"},
+            {"user": "Valid", "assistant": 123}
+        ]}"#;
+        let turns = parse_vim_history_turns(json);
+        // First two turns skipped (user not a string), third has empty assistant (not a string)
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "Valid");
+        assert_eq!(turns[0].assistant, "");
+    }
+
+    #[test]
+    fn test_parse_vim_history_turns_truncation() {
+        // Create content exceeding MAX_HISTORY_TURN_CHARS
+        let long_user = "x".repeat(MAX_HISTORY_TURN_CHARS + 100);
+        let long_assistant = "y".repeat(MAX_HISTORY_TURN_CHARS + 500);
+        let json = format!(
+            r#"{{"llm_history_turns": [{{"user": "{}", "assistant": "{}"}}]}}"#,
+            long_user, long_assistant
+        );
+        let turns = parse_vim_history_turns(&json);
+        assert_eq!(turns.len(), 1);
+        // User should be truncated
+        assert!(turns[0].user.len() < long_user.len());
+        assert!(turns[0].user.ends_with("\n(…truncated)"));
+        assert_eq!(turns[0].user.len(), MAX_HISTORY_TURN_CHARS + "\n(…truncated)".len());
+        // Assistant should be truncated
+        assert!(turns[0].assistant.len() < long_assistant.len());
+        assert!(turns[0].assistant.ends_with("\n(…truncated)"));
+    }
+
+    #[test]
+    fn test_truncate_turn_content_under_limit() {
+        let short = "Hello, world!";
+        assert_eq!(truncate_turn_content(short), short);
+    }
+
+    #[test]
+    fn test_truncate_turn_content_at_limit() {
+        let exact = "a".repeat(MAX_HISTORY_TURN_CHARS);
+        assert_eq!(truncate_turn_content(&exact), exact);
+    }
+
+    #[test]
+    fn test_truncate_turn_content_over_limit() {
+        let over = "b".repeat(MAX_HISTORY_TURN_CHARS + 1000);
+        let result = truncate_turn_content(&over);
+        assert!(result.ends_with("\n(…truncated)"));
+        assert!(result.len() < over.len());
+        // Result should be exactly MAX chars + marker length
+        assert_eq!(result.len(), MAX_HISTORY_TURN_CHARS + "\n(…truncated)".len());
+    }
+
+    #[test]
+    fn test_split_json_content_blocks_normal() {
+        let json = r#"{"llm_history": "history text", "buffers": [{"name": "test.rs"}], "active_buffer": "fn main() {}", "prompt": "explain this", "_cache_hints": {"breakpoint_after": ["llm_history", "buffers"], "stable_fields": ["llm_history", "buffers"], "dynamic_fields": ["prompt"]}}"#;
+        let blocks = split_json_content_blocks(json);
+        assert_eq!(blocks.len(), 4);
+        // llm_history is a string field
+        assert_eq!(blocks[0].field_name, "llm_history");
+        assert_eq!(blocks[0].text, "history text");
+        assert!(blocks[0].is_breakpoint);
+        // buffers is an array — serialized with label
+        assert_eq!(blocks[1].field_name, "buffers");
+        assert!(blocks[1].text.starts_with("buffers:"));
+        assert!(blocks[1].is_breakpoint);
+        // active_buffer is a string
+        assert_eq!(blocks[2].field_name, "active_buffer");
+        assert_eq!(blocks[2].text, "fn main() {}");
+        assert!(!blocks[2].is_breakpoint);
+        // prompt is a string
+        assert_eq!(blocks[3].field_name, "prompt");
+        assert_eq!(blocks[3].text, "explain this");
+        assert!(!blocks[3].is_breakpoint);
+    }
+
+    #[test]
+    fn test_split_json_content_blocks_no_hints() {
+        // Without _cache_hints, returns empty
+        let json = r#"{"llm_history": "text", "buffers": [], "prompt": "hello"}"#;
+        let blocks = split_json_content_blocks(json);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_split_json_content_blocks_empty_breakpoint_after() {
+        // With empty breakpoint_after array, returns empty
+        let json = r#"{"prompt": "hello", "_cache_hints": {"breakpoint_after": []}}"#;
+        let blocks = split_json_content_blocks(json);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_split_json_content_blocks_skips_metadata_fields() {
+        // Fields starting with _ and llm_history_turns are skipped
+        let json = r#"{"llm_history_turns": [{"user": "hi"}], "buffers": "buf content", "_internal": "skip me", "prompt": "hello", "_cache_hints": {"breakpoint_after": ["buffers"]}}"#;
+        let blocks = split_json_content_blocks(json);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].field_name, "buffers");
+        assert_eq!(blocks[1].field_name, "prompt");
+    }
+
+    #[test]
+    fn test_split_json_content_blocks_skips_null_and_empty() {
+        let json = r#"{"field1": null, "field2": "", "field3": "content", "_cache_hints": {"breakpoint_after": ["field3"]}}"#;
+        let blocks = split_json_content_blocks(json);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].field_name, "field3");
+        assert_eq!(blocks[0].text, "content");
+        assert!(blocks[0].is_breakpoint);
+    }
+
+    #[test]
+    fn test_split_json_content_blocks_non_json() {
+        assert!(split_json_content_blocks("not json").is_empty());
+        assert!(split_json_content_blocks("").is_empty());
+        assert!(split_json_content_blocks("[1,2,3]").is_empty());
+    }
+
+    #[test]
+    fn test_split_json_content_blocks_preserves_order() {
+        // Verify that field order from the JSON is preserved
+        let json = r#"{"alpha": "aaa", "beta": "bbb", "gamma": "ggg", "_cache_hints": {"breakpoint_after": ["beta"]}}"#;
+        let blocks = split_json_content_blocks(json);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].field_name, "alpha");
+        assert!(!blocks[0].is_breakpoint);
+        assert_eq!(blocks[1].field_name, "beta");
+        assert!(blocks[1].is_breakpoint);
+        assert_eq!(blocks[2].field_name, "gamma");
+        assert!(!blocks[2].is_breakpoint);
+    }
+
+    #[test]
+    fn test_split_json_content_blocks_object_value() {
+        // Object values get serialized with field_name: prefix
+        let json = r#"{"config": {"key": "value", "num": 42}, "prompt": "hi", "_cache_hints": {"breakpoint_after": ["config"]}}"#;
+        let blocks = split_json_content_blocks(json);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].field_name, "config");
+        assert!(blocks[0].text.starts_with("config:"));
+        assert!(blocks[0].text.contains("\"key\""));
+        assert!(blocks[0].is_breakpoint);
+    }
 }

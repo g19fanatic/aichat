@@ -318,6 +318,8 @@ impl Server {
             top_p,
             functions,
             stream,
+            cache_content_blocks: vec![],
+            cache_warm: false,
         };
 
         if stream {

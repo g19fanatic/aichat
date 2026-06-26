@@ -171,6 +171,8 @@ pub fn claude_build_chat_completions_body(
         top_p,
         functions,
         stream,
+        cache_content_blocks,
+        cache_warm,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -281,6 +283,11 @@ pub fn claude_build_chat_completions_body(
     if let Some(v) = model.max_tokens_param() {
         body["max_tokens"] = v.into();
     }
+    // Cache warming: override max_tokens to 1 to minimize response cost.
+    // The purpose is to prime the cache, not to get a useful response.
+    if cache_warm {
+        body["max_tokens"] = json!(1);
+    }
     if let Some(v) = temperature {
         body["temperature"] = v.into();
     }
@@ -291,7 +298,7 @@ pub fn claude_build_chat_completions_body(
         body["stream"] = true.into();
     }
     if let Some(functions) = functions {
-        body["tools"] = functions
+        let mut tools: Vec<Value> = functions
             .iter()
             .map(|v| {
                 json!({
@@ -301,6 +308,10 @@ pub fn claude_build_chat_completions_body(
                 })
             })
             .collect();
+        tools.sort_by(|a, b| {
+            a["name"].as_str().unwrap_or("").cmp(&b["name"].as_str().unwrap_or(""))
+        });
+        body["tools"] = json!(tools);
     }
 
     // Smart prompt caching: enable when there's a stable prefix worth caching
@@ -308,14 +319,50 @@ pub fn claude_build_chat_completions_body(
         || body["messages"].as_array().map_or(false, |m| m.len() > 1)
         || body.get("tools").is_some();
     if should_cache {
-        body["cache_control"] = json!({"type": "ephemeral"});
+        // Add cache_control to last tool for tool-level caching
+        if let Some(tools_arr) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            if let Some(last_tool) = tools_arr.last_mut() {
+                last_tool["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
         // Explicit block-level cache_control on system message for better cache granularity
         if let Some(system_str) = body.get("system").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+            let cache_control = if claude_supports_extended_cache(model) {
+                json!({"type": "ephemeral", "ttl": "1h"})
+            } else {
+                json!({"type": "ephemeral"})
+            };
             body["system"] = json!([{
                 "type": "text",
                 "text": system_str,
-                "cache_control": {"type": "ephemeral"}
+                "cache_control": cache_control
             }]);
+        }
+        // Split last user message into content blocks based on _cache_hints.
+        // When cache_content_blocks are present, the user message text has been parsed into
+        // named blocks. We replace the last user message content with an array of text blocks,
+        // adding cache_control to blocks designated as breakpoints (is_breakpoint=true).
+        // This enables per-field caching: stable fields (buffers, file_arguments) get cached
+        // independently, while dynamic fields (active_buffer, prompt) are not cached.
+        if !cache_content_blocks.is_empty() {
+            if let Some(messages_arr) = body["messages"].as_array() {
+                let msgs_len = messages_arr.len();
+                if let Some(last_user_idx) = (0..msgs_len).rev()
+                    .find(|&i| messages_arr[i]["role"] == "user")
+                {
+                    let content_blocks: Vec<Value> = cache_content_blocks.iter().map(|block| {
+                        let mut obj = json!({
+                            "type": "text",
+                            "text": block.text,
+                        });
+                        if block.is_breakpoint {
+                            obj["cache_control"] = json!({"type": "ephemeral"});
+                        }
+                        obj
+                    }).collect();
+                    body["messages"][last_user_idx]["content"] = json!(content_blocks);
+                }
+            }
         }
         // Explicit cache_control on last message for multi-turn conversation caching
         if let Some(messages_len) = body["messages"].as_array().map(|m| m.len()).filter(|&len| len > 1) {
@@ -330,6 +377,83 @@ pub fn claude_build_chat_completions_body(
                 let content_len = body["messages"][last_idx]["content"].as_array().map_or(0, |a| a.len());
                 if content_len > 0 {
                     body["messages"][last_idx]["content"][content_len - 1]["cache_control"] = json!({"type": "ephemeral"});
+                }
+            }
+        }
+        // Cache breakpoint at last history turn boundary
+        // When multi-turn history messages are present (more than 2 messages from turns),
+        // place cache_control on the last assistant message before the current user message.
+        // This ensures the entire conversation history prefix is cached across requests,
+        // so each new turn only pays for new content after this boundary.
+        if let Some(messages_arr) = body["messages"].as_array() {
+            let msgs_len = messages_arr.len();
+            // Need at least 4 messages: history user + history assistant + ... + current user
+            if msgs_len > 3 {
+                // Find the last assistant message before the final message
+                if let Some(last_asst_idx) = (0..msgs_len - 1)
+                    .rev()
+                    .find(|&i| messages_arr[i]["role"] == "assistant")
+                {
+                    if let Some(content_str) = body["messages"][last_asst_idx]["content"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                    {
+                        body["messages"][last_asst_idx]["content"] = json!([{
+                            "type": "text",
+                            "text": content_str,
+                            "cache_control": {"type": "ephemeral"}
+                        }]);
+                    } else if body["messages"][last_asst_idx]["content"].is_array() {
+                        let content_len = body["messages"][last_asst_idx]["content"]
+                            .as_array()
+                            .map_or(0, |a| a.len());
+                        if content_len > 0 {
+                            body["messages"][last_asst_idx]["content"][content_len - 1]["cache_control"] =
+                                json!({"type": "ephemeral"});
+                        }
+                    }
+                }
+            }
+        }
+        // Intermediate stepping-stone breakpoint for long conversations
+        // When multi-turn history is present, place the stepping stone within the
+        // history region rather than across all messages. This creates layered cache
+        // hits: early history stays cached even as new turns push the boundary forward.
+        if let Some(messages_len) = body["messages"].as_array().map(|m| m.len()).filter(|&len| len > 3) {
+            // Find the history boundary: last assistant message before the final message
+            let history_end = body["messages"].as_array()
+                .and_then(|arr| (0..messages_len - 1).rev()
+                    .find(|&i| arr[i]["role"] == "assistant"))
+                .unwrap_or(0);
+            // Only place stepping stone if history region is substantial (>10 messages)
+            if history_end > 10 {
+                let mid_idx = history_end / 2;
+                // Find a user message near the midpoint within history
+                let target_idx = (mid_idx..history_end)
+                    .find(|&i| body["messages"][i]["role"] == "user")
+                    .or_else(|| (0..mid_idx).rev()
+                        .find(|&i| body["messages"][i]["role"] == "user"))
+                    .unwrap_or(mid_idx);
+                // Only place if within history bounds and not on a message with existing breakpoint
+                if target_idx < history_end && target_idx < messages_len - 1 {
+                    if let Some(content_str) = body["messages"][target_idx]["content"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                    {
+                        body["messages"][target_idx]["content"] = json!([{
+                            "type": "text",
+                            "text": content_str,
+                            "cache_control": {"type": "ephemeral"}
+                        }]);
+                    } else if body["messages"][target_idx]["content"].is_array() {
+                        let content_len = body["messages"][target_idx]["content"]
+                            .as_array()
+                            .map_or(0, |a| a.len());
+                        if content_len > 0 {
+                            body["messages"][target_idx]["content"][content_len - 1]["cache_control"] =
+                                json!({"type": "ephemeral"});
+                        }
+                    }
                 }
             }
         }
@@ -383,13 +507,26 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         bail!("Invalid response data: {data}");
     }
 
+    let extra = {
+        let cache_creation = data["usage"]["cache_creation_input_tokens"].as_u64();
+        let cache_read = data["usage"]["cache_read_input_tokens"].as_u64();
+        if cache_creation.is_some() || cache_read.is_some() {
+            Some(json!({
+                "cache_creation_input_tokens": cache_creation,
+                "cache_read_input_tokens": cache_read,
+            }))
+        } else {
+            None
+        }
+    };
+
     let output = ChatCompletionsOutput {
         text: text.to_string(),
         tool_calls,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["output_tokens"].as_u64(),
-        extra: None,
+        extra,
     };
     Ok(output)
 }

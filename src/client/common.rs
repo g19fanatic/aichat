@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::{
-    config::{Config, GlobalConfig, Input},
+    config::{Config, GlobalConfig, Input, CacheContentBlock},
     function::{eval_tool_calls, FunctionDeclaration, ToolCall, ToolResult},
     render::render_stream,
     utils::*,
@@ -328,6 +328,8 @@ pub struct ChatCompletionsData {
     pub top_p: Option<f64>,
     pub functions: Option<Vec<FunctionDeclaration>>,
     pub stream: bool,
+    pub cache_content_blocks: Vec<CacheContentBlock>,
+    pub cache_warm: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -492,6 +494,12 @@ pub async fn call_chat_completions(
                             .unwrap_or("-");
                         eprintln!("⚡ Bifrost cache {status} ({hit_type}) [{cache_id}]");
                         }
+                    }
+                    let cache_creation = extra.get("cache_creation_input_tokens").and_then(|v| v.as_u64());
+                    let cache_read = extra.get("cache_read_input_tokens").and_then(|v| v.as_u64());
+                    if cache_creation.is_some() || cache_read.is_some() {
+                        eprintln!("📦 Cache: {} read, {} written",
+                            cache_read.unwrap_or(0), cache_creation.unwrap_or(0));
                     }
                 }
             }

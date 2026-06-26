@@ -432,6 +432,8 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
         top_p,
         functions,
         stream: _,
+        cache_content_blocks: _,
+        cache_warm: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -823,6 +825,8 @@ fn build_responses_api_body(data: ChatCompletionsData, model: &Model) -> Value {
         top_p,
         functions,
         stream,
+        cache_content_blocks: _,
+        cache_warm: _,
     } = data;
 
     // Convert messages to the Responses API "input" format.
@@ -1098,7 +1102,7 @@ mod tests {
             Message::new(MessageRole::System, MessageContent::Text("sys".into())),
             Message::new(MessageRole::User, MessageContent::ToolCalls(tc)),
         ];
-        let data = ChatCompletionsData { messages, temperature: None, top_p: None, functions: None, stream: false };
+        let data = ChatCompletionsData { messages, temperature: None, top_p: None, functions: None, stream: false, cache_content_blocks: vec![], cache_warm: false };
         let model = Model::new("bedrock", "test-model");
         build_chat_completions_body(data, &model).unwrap()
     }

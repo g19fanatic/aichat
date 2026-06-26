@@ -1,0 +1,528 @@
+{
+  "directed": true,
+  "metadata": {
+    "title": "aichat GPT-5.5 Tool Calling Bug - Knowledge Graph",
+    "description": "Knowledge graph of findings from investigation into aichat's OpenAI GPT-5.5 'Invalid Responses API response data' error",
+    "source": "ralph-loop research investigation",
+    "generated": "2026-06-03",
+    "method": "manual construction from 14 research findings (graphify semantic extraction unavailable due to expired AWS SSO)",
+    "findings_count": 14
+  },
+  "nodes": [
+    {
+      "id": "error_observed",
+      "label": "Observed Error",
+      "type": "symptom",
+      "description": "Error: Failed to call chat-completions api / Caused by: Invalid Responses API response data",
+      "source": "user report",
+      "cluster": "error_manifestation"
+    },
+    {
+      "id": "empty_output",
+      "label": "Empty Output Array",
+      "type": "symptom",
+      "description": "GPT-5.5 returns output:[] with status:'completed', 0 output tokens, 0 reasoning tokens",
+      "source": "findings/06-empty-output-root-cause.md",
+      "cluster": "error_manifestation"
+    },
+    {
+      "id": "bail_macro",
+      "label": "bail!() at bedrock.rs:982",
+      "type": "code_defect",
+      "description": "Response parser crashes with bail! when output is empty instead of handling gracefully",
+      "file": "src/client/bedrock.rs:981-982",
+      "source": "findings/12-error-path-analysis.md",
+      "cluster": "error_handling"
+    },
+    {
+      "id": "graceful_handler",
+      "label": "Graceful Handler in openai.rs:427",
+      "type": "code_reference",
+      "description": "Chat Completions handler returns empty with warn!() - the correct pattern",
+      "file": "src/client/openai.rs:427-437",
+      "source": "findings/04-aichat-responses-api-code.md",
+      "cluster": "error_handling"
+    },
+    {
+      "id": "strict_mode_autonorm",
+      "label": "Strict Mode Auto-Normalization",
+      "type": "root_cause",
+      "description": "Responses API auto-normalizes schemas to strict mode when 'strict' field is omitted, adding all properties to required and setting additionalProperties:false",
+      "source": "findings/01-strict-mode-requirements.md, findings/08-structured-outputs-rules.md",
+      "cluster": "api_behavior"
+    },
+    {
+      "id": "missing_strict_false",
+      "label": "Missing strict:false in aichat",
+      "type": "root_cause",
+      "description": "aichat never sets 'strict' field on tool schemas (0 occurrences in src/). Without explicit strict:false, Responses API auto-normalizes to strict",
+      "file": "src/client/bedrock.rs:913-924",
+      "source": "findings/04-aichat-responses-api-code.md, findings/07-schema-generation-code.md",
+      "cluster": "code_defect_primary"
+    },
+    {
+      "id": "schema_violations",
+      "label": "Schema Strict Mode Violations",
+      "type": "root_cause",
+      "description": "12/22 tools have properties not in required array (48 total violations). ALL 22 tools missing additionalProperties:false",
+      "source": "findings/02-schema-violations.md, findings/09-hypothesis-test.md",
+      "cluster": "schema_issues"
+    },
+    {
+      "id": "gpt55_literal",
+      "label": "GPT-5.5 Literal Compliance Behavior",
+      "type": "contributing_factor",
+      "description": "GPT-5.5 'interprets prompts in a literal and thorough manner' - refuses rather than violates schema constraints",
+      "source": "findings/03-gpt55-tool-calling.md",
+      "cluster": "model_behavior"
+    },
+    {
+      "id": "tool_count_22",
+      "label": "22 Tools Exceed Soft Limit",
+      "type": "contributing_factor",
+      "description": "22 tools exceed OpenAI's recommended <20 per turn. More tools = more constraint conflicts",
+      "source": "findings/13-token-tool-limits.md",
+      "cluster": "configuration"
+    },
+    {
+      "id": "json_schema_struct",
+      "label": "JsonSchema Struct Limitation",
+      "type": "code_defect",
+      "description": "JsonSchema struct at function.rs:127-149 has no additionalProperties field - structurally cannot represent strict-mode compliance",
+      "file": "src/function.rs:127-149",
+      "source": "findings/07-schema-generation-code.md",
+      "cluster": "schema_issues"
+    },
+    {
+      "id": "passthrough_pipeline",
+      "label": "Zero-Transformation Schema Pipeline",
+      "type": "contributing_factor",
+      "description": "Schema pipeline is pure passthrough: functions.json → deserialize → filter → serialize. No validation or strict-mode compliance checking",
+      "source": "findings/07-schema-generation-code.md",
+      "cluster": "schema_issues"
+    },
+    {
+      "id": "custom_patch",
+      "label": "Unreviewed Custom Patch (b92c83d)",
+      "type": "contributing_factor",
+      "description": "Responses API code in bedrock.rs is a local custom patch (Jun 3, 2026). PR #1318 was rejected upstream. No code review caught the bail!() or missing strict:false",
+      "source": "findings/10-aichat-github-issues.md",
+      "cluster": "project_history"
+    },
+    {
+      "id": "responses_api",
+      "label": "OpenAI Responses API",
+      "type": "component",
+      "description": "Newer API that replaces Chat Completions. Different default behavior: auto-normalizes to strict mode vs Chat Completions' non-strict default",
+      "source": "findings/11-responses-vs-completions.md",
+      "cluster": "api_behavior"
+    },
+    {
+      "id": "chat_completions_api",
+      "label": "OpenAI Chat Completions API",
+      "type": "component",
+      "description": "Legacy API. Non-strict by default - schemas work as best-effort matching without normalization",
+      "source": "findings/11-responses-vs-completions.md",
+      "cluster": "api_behavior"
+    },
+    {
+      "id": "bedrock_rs",
+      "label": "bedrock.rs (Responses API Client)",
+      "type": "component",
+      "description": "Custom implementation handling Bedrock OpenAI models via Responses API. Contains build_responses_api_body (818-928) and response parsers (932-992)",
+      "file": "src/client/bedrock.rs",
+      "source": "findings/04-aichat-responses-api-code.md, findings/12-error-path-analysis.md",
+      "cluster": "implementation"
+    },
+    {
+      "id": "openai_rs",
+      "label": "openai.rs (Chat Completions Client)",
+      "type": "component",
+      "description": "Standard Chat Completions implementation with graceful empty-output handling",
+      "file": "src/client/openai.rs",
+      "source": "findings/04-aichat-responses-api-code.md",
+      "cluster": "implementation"
+    },
+    {
+      "id": "function_rs",
+      "label": "function.rs (Schema Definitions)",
+      "type": "component",
+      "description": "Contains JsonSchema struct, FunctionDeclaration, and Functions::init() for loading tool schemas",
+      "file": "src/function.rs",
+      "source": "findings/07-schema-generation-code.md",
+      "cluster": "implementation"
+    },
+    {
+      "id": "gui_session_tool",
+      "label": "gui_session Tool (Worst Offender)",
+      "type": "evidence",
+      "description": "13/14 properties missing from required array - most severely violated tool schema",
+      "source": "findings/09-hypothesis-test.md",
+      "cluster": "schema_issues"
+    },
+    {
+      "id": "ralph_loop_tool",
+      "label": "ralph_loop Tool (Mutually Exclusive Params)",
+      "type": "evidence",
+      "description": "10/10 properties missing from required - contains mutually exclusive parameters that cannot all be satisfied simultaneously",
+      "source": "findings/09-hypothesis-test.md",
+      "cluster": "schema_issues"
+    },
+    {
+      "id": "single_tool_works",
+      "label": "Single Tool Call Works Fine",
+      "type": "evidence",
+      "description": "User observation: '1 simple tool call works just fine' - consistent with root cause since single compliant tool has no constraint conflicts",
+      "source": "user report",
+      "cluster": "evidence"
+    },
+    {
+      "id": "pr_1318_rejected",
+      "label": "PR #1318 (Responses API) Rejected",
+      "type": "evidence",
+      "description": "Upstream maintainer explicitly rejected Responses API support (Jun 2025). Code appeared anyway in bedrock.rs as custom patch",
+      "source": "findings/10-aichat-github-issues.md",
+      "cluster": "project_history"
+    },
+    {
+      "id": "pr_1340_partial_fix",
+      "label": "PR #1340 (Empty Output Fix - Chat Completions Only)",
+      "type": "evidence",
+      "description": "Fixed empty output handling only for openai.rs, NOT for bedrock.rs Responses API handler",
+      "source": "findings/10-aichat-github-issues.md",
+      "cluster": "project_history"
+    },
+    {
+      "id": "fix_strict_false",
+      "label": "Fix: Add strict:false to bedrock.rs",
+      "type": "fix",
+      "description": "One-line fix: add '\"strict\": false' to tool schema JSON in bedrock.rs:913-924. Opts out of auto-normalization",
+      "file": "src/client/bedrock.rs:913-924",
+      "source": "findings/14-root-cause-analysis.md",
+      "cluster": "fixes"
+    },
+    {
+      "id": "fix_graceful_empty",
+      "label": "Fix: Graceful Empty Output Handling",
+      "type": "fix",
+      "description": "Replace bail!() with warn!() + return empty at bedrock.rs:981-982, matching openai.rs pattern",
+      "file": "src/client/bedrock.rs:981-982",
+      "source": "findings/14-root-cause-analysis.md",
+      "cluster": "fixes"
+    },
+    {
+      "id": "fix_schema_compliance",
+      "label": "Fix: Make Schemas Strict-Compliant",
+      "type": "fix",
+      "description": "Add additionalProperties:false to JsonSchema, put all props in required, use nullable types for optional params",
+      "file": "src/function.rs:127-149",
+      "source": "findings/14-root-cause-analysis.md",
+      "cluster": "fixes"
+    },
+    {
+      "id": "undocumented_behavior",
+      "label": "Undocumented API Behavior",
+      "type": "contributing_factor",
+      "description": "OpenAI docs say invalid strict schemas should be rejected, but API actually auto-normalizes and accepts them - creating unsatisfiable constraints silently",
+      "source": "findings/06-empty-output-root-cause.md",
+      "cluster": "api_behavior"
+    },
+    {
+      "id": "bedrock_mantle",
+      "label": "Bedrock Mantle (OpenAI Routing)",
+      "type": "component",
+      "description": "AWS Bedrock infrastructure that routes 'openai.*' models to /openai/v1/responses endpoint",
+      "source": "findings/05-response-fields-analysis.md",
+      "cluster": "infrastructure"
+    },
+    {
+      "id": "response_fields_ignored",
+      "label": "Response Fields Ignored (24/30+)",
+      "type": "evidence",
+      "description": "Parser uses only 6 fields from 30+ in response (text, type, name, arguments, call_id, usage). Status, error, incomplete_details, moderation all ignored",
+      "source": "findings/05-response-fields-analysis.md",
+      "cluster": "error_handling"
+    }
+  ],
+  "edges": [
+    {
+      "source": "missing_strict_false",
+      "target": "strict_mode_autonorm",
+      "relation": "enables",
+      "context": "Without explicit strict:false, API auto-normalizes schemas to strict mode",
+      "weight": 1.0
+    },
+    {
+      "source": "strict_mode_autonorm",
+      "target": "schema_violations",
+      "relation": "amplifies",
+      "context": "Auto-normalization transforms optional params into required non-nullable fields, creating unsatisfiable constraints",
+      "weight": 1.0
+    },
+    {
+      "source": "schema_violations",
+      "target": "empty_output",
+      "relation": "causes",
+      "context": "Unsatisfiable constraints prevent GPT-5.5 from producing any valid output",
+      "weight": 1.0
+    },
+    {
+      "source": "gpt55_literal",
+      "target": "empty_output",
+      "relation": "contributes_to",
+      "context": "GPT-5.5's literal compliance means it refuses rather than violates - older models would produce best-effort output",
+      "weight": 0.8
+    },
+    {
+      "source": "empty_output",
+      "target": "bail_macro",
+      "relation": "triggers",
+      "context": "Empty output array triggers the bail!() crash in bedrock.rs response parser",
+      "weight": 1.0
+    },
+    {
+      "source": "bail_macro",
+      "target": "error_observed",
+      "relation": "produces",
+      "context": "bail!() generates 'Invalid Responses API response data' error shown to user",
+      "weight": 1.0
+    },
+    {
+      "source": "tool_count_22",
+      "target": "empty_output",
+      "relation": "contributes_to",
+      "context": "22 tools exceed soft limit of 20, increasing likelihood of constraint conflicts",
+      "weight": 0.5
+    },
+    {
+      "source": "json_schema_struct",
+      "target": "schema_violations",
+      "relation": "causes",
+      "context": "Struct cannot represent additionalProperties:false, so ALL schemas violate strict mode",
+      "weight": 0.9
+    },
+    {
+      "source": "passthrough_pipeline",
+      "target": "schema_violations",
+      "relation": "enables",
+      "context": "No validation in pipeline means non-compliant schemas pass through unchecked",
+      "weight": 0.7
+    },
+    {
+      "source": "custom_patch",
+      "target": "bail_macro",
+      "relation": "explains",
+      "context": "Code was never reviewed, so inconsistency with openai.rs graceful handler was never caught",
+      "weight": 0.6
+    },
+    {
+      "source": "custom_patch",
+      "target": "missing_strict_false",
+      "relation": "explains",
+      "context": "Unreviewed code didn't account for Responses API strict-mode auto-normalization difference",
+      "weight": 0.6
+    },
+    {
+      "source": "responses_api",
+      "target": "strict_mode_autonorm",
+      "relation": "implements",
+      "context": "Responses API behavior: normalizes all schemas to strict when field omitted",
+      "weight": 1.0
+    },
+    {
+      "source": "chat_completions_api",
+      "target": "responses_api",
+      "relation": "differs_from",
+      "context": "Chat Completions defaults non-strict; Responses API defaults strict. Same schemas have different behavior",
+      "weight": 0.9
+    },
+    {
+      "source": "bedrock_rs",
+      "target": "bail_macro",
+      "relation": "contains",
+      "context": "bedrock.rs:981-982 contains the crashing bail!() macro",
+      "weight": 1.0
+    },
+    {
+      "source": "openai_rs",
+      "target": "graceful_handler",
+      "relation": "contains",
+      "context": "openai.rs:427-437 contains the correct graceful handling pattern",
+      "weight": 1.0
+    },
+    {
+      "source": "graceful_handler",
+      "target": "bail_macro",
+      "relation": "should_replace",
+      "context": "bail!() should be replaced with warn!()+return empty pattern from openai.rs",
+      "weight": 1.0
+    },
+    {
+      "source": "function_rs",
+      "target": "json_schema_struct",
+      "relation": "contains",
+      "context": "function.rs:127-149 defines the JsonSchema struct that lacks additionalProperties",
+      "weight": 1.0
+    },
+    {
+      "source": "gui_session_tool",
+      "target": "schema_violations",
+      "relation": "exemplifies",
+      "context": "Most severe violator: 13/14 properties missing from required",
+      "weight": 0.8
+    },
+    {
+      "source": "ralph_loop_tool",
+      "target": "schema_violations",
+      "relation": "exemplifies",
+      "context": "Demonstrates impossible constraint: mutually exclusive params all become mandatory",
+      "weight": 0.8
+    },
+    {
+      "source": "single_tool_works",
+      "target": "schema_violations",
+      "relation": "validates",
+      "context": "Single compliant tool has no conflicts - confirms root cause is multi-tool constraint accumulation",
+      "weight": 0.7
+    },
+    {
+      "source": "pr_1318_rejected",
+      "target": "custom_patch",
+      "relation": "explains_origin",
+      "context": "Upstream rejected Responses API support, code added locally without review process",
+      "weight": 0.8
+    },
+    {
+      "source": "pr_1340_partial_fix",
+      "target": "bail_macro",
+      "relation": "missed",
+      "context": "PR fixed empty output for Chat Completions only, identical issue in Responses API was missed",
+      "weight": 0.7
+    },
+    {
+      "source": "fix_strict_false",
+      "target": "missing_strict_false",
+      "relation": "resolves",
+      "context": "Adding strict:false opts out of auto-normalization, restoring best-effort behavior",
+      "weight": 1.0
+    },
+    {
+      "source": "fix_graceful_empty",
+      "target": "bail_macro",
+      "relation": "resolves",
+      "context": "Replacing bail!() with warn!()+return provides defense-in-depth for all empty output scenarios",
+      "weight": 1.0
+    },
+    {
+      "source": "fix_schema_compliance",
+      "target": "schema_violations",
+      "relation": "resolves",
+      "context": "Making schemas fully strict-compliant would allow strict:true to work correctly",
+      "weight": 1.0
+    },
+    {
+      "source": "undocumented_behavior",
+      "target": "strict_mode_autonorm",
+      "relation": "complicates",
+      "context": "API should reject invalid strict schemas per docs but instead silently normalizes creating traps",
+      "weight": 0.6
+    },
+    {
+      "source": "bedrock_mantle",
+      "target": "responses_api",
+      "relation": "routes_to",
+      "context": "Bedrock routes openai.* models to /openai/v1/responses endpoint",
+      "weight": 1.0
+    },
+    {
+      "source": "bedrock_mantle",
+      "target": "bedrock_rs",
+      "relation": "invoked_by",
+      "context": "bedrock.rs builds requests that route through Bedrock Mantle to OpenAI Responses API",
+      "weight": 0.8
+    },
+    {
+      "source": "response_fields_ignored",
+      "target": "bail_macro",
+      "relation": "contributes_to",
+      "context": "Parser ignores status/error/incomplete_details fields that could provide diagnostic info before crashing",
+      "weight": 0.5
+    },
+    {
+      "source": "fix_strict_false",
+      "target": "empty_output",
+      "relation": "prevents",
+      "context": "With strict:false, API won't normalize schemas, model can use best-effort matching",
+      "weight": 1.0
+    },
+    {
+      "source": "fix_graceful_empty",
+      "target": "error_observed",
+      "relation": "prevents",
+      "context": "Graceful handling means empty output returns warning instead of user-facing error",
+      "weight": 1.0
+    }
+  ],
+  "clusters": [
+    {
+      "id": "error_manifestation",
+      "label": "Error Manifestation",
+      "description": "The observable symptoms of the bug"
+    },
+    {
+      "id": "code_defect_primary",
+      "label": "Primary Code Defect",
+      "description": "The main code-level root cause"
+    },
+    {
+      "id": "api_behavior",
+      "label": "API Behavioral Differences",
+      "description": "How Responses API differs from Chat Completions in strict mode handling"
+    },
+    {
+      "id": "schema_issues",
+      "label": "Schema Compliance Issues",
+      "description": "Tool schema structural problems preventing strict mode compliance"
+    },
+    {
+      "id": "model_behavior",
+      "label": "Model Behavioral Factors",
+      "description": "GPT-5.5 specific behavior that triggers the bug"
+    },
+    {
+      "id": "error_handling",
+      "label": "Error Handling Deficiencies",
+      "description": "Missing graceful handling of edge cases"
+    },
+    {
+      "id": "implementation",
+      "label": "Implementation Components",
+      "description": "Source code files and structures involved"
+    },
+    {
+      "id": "project_history",
+      "label": "Project History Context",
+      "description": "How the code came to be in its current state"
+    },
+    {
+      "id": "configuration",
+      "label": "Configuration Factors",
+      "description": "Runtime configuration that contributes to the issue"
+    },
+    {
+      "id": "evidence",
+      "label": "Supporting Evidence",
+      "description": "Observations that validate the root cause hypothesis"
+    },
+    {
+      "id": "fixes",
+      "label": "Recommended Fixes",
+      "description": "Actionable solutions to resolve the bug"
+    },
+    {
+      "id": "infrastructure",
+      "label": "Infrastructure",
+      "description": "Cloud infrastructure components in the request path"
+    }
+  ]
+}

@@ -317,6 +317,8 @@ pub fn gemini_build_chat_completions_body(
         top_p,
         functions,
         stream: _,
+        cache_content_blocks: _,
+        cache_warm: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);

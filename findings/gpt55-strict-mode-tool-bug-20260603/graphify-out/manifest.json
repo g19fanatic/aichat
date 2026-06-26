@@ -1,0 +1,82 @@
+{
+  "/tmp/ralph-CiZUNG/findings/04-aichat-responses-api-code.md": {
+    "mtime": 1780517555.3137295,
+    "ast_hash": "a6a506df467f5241e996b88636130216",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/11-responses-vs-completions.md": {
+    "mtime": 1780518207.4922247,
+    "ast_hash": "4439480c8ff0ea08c841efe2b2ff5658",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/15-fix-recommendations.md": {
+    "mtime": 1780518869.7138395,
+    "ast_hash": "75cda350ef559bd8cd3c3923f3c886ab",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/17-fix-validation.md": {
+    "mtime": 1780518813.7027586,
+    "ast_hash": "362c5216ab8d7ce3f6363b7f601e4382",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/01-strict-mode-requirements.md": {
+    "mtime": 1780517156.2323985,
+    "ast_hash": "39498d81871ffcfe4501e26cbe15cf42",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/06-empty-output-root-cause.md": {
+    "mtime": 1780517494.2965271,
+    "ast_hash": "6494c2e5a4f264d514e610e4f383cbac",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/12-error-path-analysis.md": {
+    "mtime": 1780518606.278965,
+    "ast_hash": "b5e9fb363f944ebc596f101225e29dad",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/14-root-cause-analysis.md": {
+    "mtime": 1780518532.3431382,
+    "ast_hash": "a116cab7d9c976066d5c127cd9dde46a",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/18-strict-mode-patterns.md": {
+    "mtime": 1780519075.5064266,
+    "ast_hash": "479d8bac81f9b6131123a93a80d850bf",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/03-gpt55-tool-calling.md": {
+    "mtime": 1780517192.3980403,
+    "ast_hash": "c2acd57afdbbb46f5de937af83b96d67",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/07-schema-generation-code.md": {
+    "mtime": 1780518758.248541,
+    "ast_hash": "1beae1587293ef2c140051759c1a75f7",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/05-response-fields-analysis.md": {
+    "mtime": 1780517563.2346244,
+    "ast_hash": "3a15dbb312834cba36e794c1f5b40e9c",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/09-hypothesis-test.md": {
+    "mtime": 1780517965.013911,
+    "ast_hash": "204b69d922bd75c6307520518ad18ee7",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/02-schema-violations.md": {
+    "mtime": 1780517192.4940393,
+    "ast_hash": "64ad5b3e9e12a7d64b9d6dbfc0636a51",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/10-aichat-github-issues.md": {
+    "mtime": 1780518327.1363666,
+    "ast_hash": "7b276f5019b7422457039a25bc703a8b",
+    "semantic_hash": ""
+  },
+  "/tmp/ralph-CiZUNG/findings/08-structured-outputs-rules.md": {
+    "mtime": 1780517850.941595,
+    "ast_hash": "8341dddb2a5df53aab4b653a77cab355",
+    "semantic_hash": ""
+  }
+}
