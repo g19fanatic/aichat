@@ -521,7 +521,11 @@ pub fn parse_vim_history_turns(content: &str) -> Vec<VimHistoryTurn> {
 /// Truncate a turn's content if it exceeds MAX_HISTORY_TURN_CHARS.
 fn truncate_turn_content(text: &str) -> String {
     if text.len() > MAX_HISTORY_TURN_CHARS {
-        let mut truncated = text[..MAX_HISTORY_TURN_CHARS].to_string();
+        let mut end = MAX_HISTORY_TURN_CHARS;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut truncated = text[..end].to_string();
         truncated.push_str("\n(…truncated)");
         truncated
     } else {
@@ -968,6 +972,19 @@ mod tests {
         assert!(result.len() < over.len());
         // Result should be exactly MAX chars + marker length
         assert_eq!(result.len(), MAX_HISTORY_TURN_CHARS + "\n(…truncated)".len());
+    }
+
+    #[test]
+    fn test_truncate_turn_content_multibyte_boundary() {
+        // '─' is U+2500, 3 bytes in UTF-8 (E2 94 80)
+        // Place it so byte index MAX_HISTORY_TURN_CHARS falls mid-character
+        let prefix = "a".repeat(MAX_HISTORY_TURN_CHARS - 1); // 15999 ASCII bytes
+        let input = format!("{}─more text after", prefix); // '─' at bytes 15999..16002
+        let result = truncate_turn_content(&input);
+        assert!(result.ends_with("\n(…truncated)"));
+        // Should truncate BEFORE the '─' since byte 16000 is mid-character
+        assert!(result.starts_with(&prefix));
+        assert_eq!(result.len(), prefix.len() + "\n(…truncated)".len());
     }
 
     #[test]
