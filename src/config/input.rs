@@ -19,6 +19,11 @@ const SUMMARY_MAX_WIDTH: usize = 80;
 /// Maximum characters per history turn field (user or assistant).
 /// Truncates to prevent blowing out the context window with pathologically long turns.
 const MAX_HISTORY_TURN_CHARS: usize = 16000;
+// StreamingLLM (arXiv:2309.17453): initial tokens are "attention sinks" that anchor
+// model coherence. Lost in the Middle (arXiv:2307.03172): models attend most to
+// beginning and end positions. Split: 25% head (attention sink) + 75% tail (recency).
+const HEAD_CHARS: usize = 4000;
+const TAIL_CHARS: usize = 12000;
 
 /// A parsed history turn from vim-llm-assistant's llm_history_turns JSON array.
 /// Each turn represents one user/assistant exchange from the conversation history.
@@ -519,18 +524,35 @@ pub fn parse_vim_history_turns(content: &str) -> Vec<VimHistoryTurn> {
 }
 
 /// Truncate a turn's content if it exceeds MAX_HISTORY_TURN_CHARS.
-fn truncate_turn_content(text: &str) -> String {
-    if text.len() > MAX_HISTORY_TURN_CHARS {
-        let mut end = MAX_HISTORY_TURN_CHARS;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let mut truncated = text[..end].to_string();
-        truncated.push_str("\n(…truncated)");
-        truncated
-    } else {
-        text.to_string()
+///
+/// Uses a head+tail strategy: keeps the first HEAD_CHARS bytes (attention sink) and
+/// the last TAIL_CHARS bytes (recency bias), replacing the middle with a sentinel.
+/// Both cut points are walked to safe UTF-8 char boundaries.
+fn truncate_turn_content(content: &str) -> String {
+    if content.len() <= MAX_HISTORY_TURN_CHARS {
+        return content.to_string();
     }
+
+    // Find safe head end (walk backwards to char boundary)
+    let mut head_end = HEAD_CHARS;
+    while head_end > 0 && !content.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+
+    // Find safe tail start (walk forwards to char boundary)
+    let tail_target = content.len().saturating_sub(TAIL_CHARS);
+    let mut tail_start = tail_target;
+    while tail_start < content.len() && !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+
+    let dropped = tail_start - head_end;
+    format!(
+        "{}\n[... {} chars truncated from middle ...]\n{}",
+        &content[..head_end],
+        dropped,
+        &content[tail_start..]
+    )
 }
 
 /// Parse `_cache_hints` from JSON content and split field values into content blocks.
@@ -945,11 +967,17 @@ mod tests {
         assert_eq!(turns.len(), 1);
         // User should be truncated
         assert!(turns[0].user.len() < long_user.len());
-        assert!(turns[0].user.ends_with("\n(…truncated)"));
-        assert_eq!(turns[0].user.len(), MAX_HISTORY_TURN_CHARS + "\n(…truncated)".len());
+        // Head preserved (first HEAD_CHARS chars)
+        assert!(turns[0].user.starts_with(&"x".repeat(HEAD_CHARS)));
+        // Tail preserved (last TAIL_CHARS chars)
+        assert!(turns[0].user.ends_with(&"x".repeat(TAIL_CHARS)));
+        // Sentinel present in middle
+        assert!(turns[0].user.contains("[..."));
         // Assistant should be truncated
         assert!(turns[0].assistant.len() < long_assistant.len());
-        assert!(turns[0].assistant.ends_with("\n(…truncated)"));
+        assert!(turns[0].assistant.starts_with(&"y".repeat(HEAD_CHARS)));
+        assert!(turns[0].assistant.ends_with(&"y".repeat(TAIL_CHARS)));
+        assert!(turns[0].assistant.contains("[..."));
     }
 
     #[test]
@@ -968,23 +996,111 @@ mod tests {
     fn test_truncate_turn_content_over_limit() {
         let over = "b".repeat(MAX_HISTORY_TURN_CHARS + 1000);
         let result = truncate_turn_content(&over);
-        assert!(result.ends_with("\n(…truncated)"));
+        // Head preserved (first HEAD_CHARS)
+        assert!(result.starts_with(&"b".repeat(HEAD_CHARS)));
+        // Tail preserved (last TAIL_CHARS)
+        assert!(result.ends_with(&"b".repeat(TAIL_CHARS)));
+        // Sentinel present in middle
+        assert!(result.contains("[..."));
+        // Overall length is less than original
         assert!(result.len() < over.len());
-        // Result should be exactly MAX chars + marker length
-        assert_eq!(result.len(), MAX_HISTORY_TURN_CHARS + "\n(…truncated)".len());
     }
 
     #[test]
     fn test_truncate_turn_content_multibyte_boundary() {
         // '─' is U+2500, 3 bytes in UTF-8 (E2 94 80)
-        // Place it so byte index MAX_HISTORY_TURN_CHARS falls mid-character
-        let prefix = "a".repeat(MAX_HISTORY_TURN_CHARS - 1); // 15999 ASCII bytes
-        let input = format!("{}─more text after", prefix); // '─' at bytes 15999..16002
-        let result = truncate_turn_content(&input);
-        assert!(result.ends_with("\n(…truncated)"));
-        // Should truncate BEFORE the '─' since byte 16000 is mid-character
-        assert!(result.starts_with(&prefix));
-        assert_eq!(result.len(), prefix.len() + "\n(…truncated)".len());
+
+        // Test 1: multibyte char at HEAD cut point
+        // Place '─' so byte HEAD_CHARS falls inside it (head_end walks back to HEAD_CHARS-1)
+        let head_prefix = "a".repeat(HEAD_CHARS - 1); // 3999 ASCII bytes
+        let padding = "b".repeat(MAX_HISTORY_TURN_CHARS + 100); // enough to exceed limit
+        let input1 = format!("{}─{}", head_prefix, padding);
+        // Must not panic (UTF-8 boundary safety)
+        let result1 = truncate_turn_content(&input1);
+        // head_end walked back to HEAD_CHARS-1 (before the '─')
+        assert!(result1.starts_with(&head_prefix));
+        // '─' should NOT appear in the head portion
+        assert!(!result1[..head_prefix.len()].contains('─'));
+        // Sentinel must be present
+        assert!(result1.contains("[..."));
+
+        // Test 2: multibyte char at TAIL cut point
+        // input2.len() = 4000 + 3 + 11998 = 16001, tail_target = 4001 (inside '─')
+        // tail_start walks forward from 4001 to 4003 (first byte after '─')
+        let tail_prefix2 = "c".repeat(4000);
+        let tail_suffix2 = "d".repeat(11998);
+        let input2 = format!("{}─{}", tail_prefix2, tail_suffix2);
+        // input2.len() = 4000 + 3 + 11998 = 16001 > MAX_HISTORY_TURN_CHARS
+        // Must not panic (UTF-8 boundary safety)
+        let result2 = truncate_turn_content(&input2);
+        // Sentinel present
+        assert!(result2.contains("[..."));
+        // Valid UTF-8 throughout (would panic if sliced at invalid boundary)
+        let _char_count = result2.chars().count();
+        // Tail ends with the 'd' suffix (all 'd's from after '─' onward)
+        assert!(result2.ends_with(&tail_suffix2));
+    }
+
+    #[test]
+    fn test_truncate_turn_content_exact_sentinel_format() {
+        // Verify the EXACT sentinel format string and dropped byte count
+        // All-ASCII content: head_end=HEAD_CHARS, tail_start=content.len()-TAIL_CHARS
+        // dropped = tail_start - head_end (exact byte count of the dropped middle)
+        let extra = 100usize;
+        let content = "z".repeat(MAX_HISTORY_TURN_CHARS + extra);
+        let result = truncate_turn_content(&content);
+
+        // Exact head content
+        assert!(result.starts_with(&"z".repeat(HEAD_CHARS)));
+        // Exact tail content
+        assert!(result.ends_with(&"z".repeat(TAIL_CHARS)));
+
+        // Compute expected dropped count
+        let head_end = HEAD_CHARS; // all ASCII
+        let tail_start = (MAX_HISTORY_TURN_CHARS + extra) - TAIL_CHARS; // = HEAD_CHARS + extra = 4100
+        let expected_dropped = tail_start - head_end; // = extra = 100
+        let expected_sentinel = format!("\n[... {} chars truncated from middle ...]\n", expected_dropped);
+
+        // Exact sentinel format
+        assert!(
+            result.contains(&expected_sentinel),
+            "Expected sentinel '{}' not found in result",
+            expected_sentinel
+        );
+
+        // Sentinel appears exactly once
+        assert_eq!(
+            result.matches(&expected_sentinel as &str).count(),
+            1,
+            "Sentinel should appear exactly once"
+        );
+    }
+
+    #[test]
+    fn test_truncate_turn_content_exact_limit_boundary() {
+        // Exactly one byte over the limit → should truncate with sentinel
+        // Note: result.len() may be LARGER than content.len() when the dropped middle
+        // (content.len() - HEAD_CHARS - TAIL_CHARS = 1 byte) is smaller than the sentinel text.
+        // The key invariants are: head preserved, tail preserved, sentinel present.
+        let content = "q".repeat(MAX_HISTORY_TURN_CHARS + 1);
+        let result = truncate_turn_content(&content);
+        // head preserved
+        assert!(result.starts_with(&"q".repeat(HEAD_CHARS)));
+        // tail preserved
+        assert!(result.ends_with(&"q".repeat(TAIL_CHARS)));
+        // sentinel present (truncation was applied) — middle 1 byte replaced by sentinel text
+        assert!(result.contains("\n[... 1 chars truncated from middle ...]\n"));
+    }
+
+    #[test]
+    fn test_truncate_turn_content_no_sentinel_at_limit() {
+        // Content exactly at the limit → no truncation, no sentinel
+        let content = "r".repeat(MAX_HISTORY_TURN_CHARS);
+        let result = truncate_turn_content(&content);
+        // No sentinel
+        assert!(!result.contains("[..."));
+        // Identical to input
+        assert_eq!(result, content);
     }
 
     #[test]
