@@ -4,6 +4,7 @@ mod role;
 mod session;
 
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
+pub use self::agent::RetryConfig;
 pub use self::input::Input;
 pub use self::input::CacheContentBlock;
 pub use self::role::{
@@ -118,6 +119,9 @@ pub struct Config {
     pub mapping_tools: IndexMap<String, String>,
     pub use_tools: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_retry: Option<agent::RetryConfig>,
+
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
     pub agent_prelude: Option<String>,
@@ -194,6 +198,8 @@ impl Default for Config {
             function_calling: true,
             mapping_tools: Default::default(),
             use_tools: None,
+
+            tool_call_retry: None,
 
             repl_prelude: None,
             cmd_prelude: None,

@@ -2,7 +2,7 @@ use super::*;
 
 use crate::{
     client::Model,
-    function::{run_llm_function, Functions},
+    function::{run_llm_function_with_retry, Functions},
 };
 
 use anyhow::{Context, Result};
@@ -268,6 +268,10 @@ impl Agent {
         &self.config.variables
     }
 
+    pub fn retry_config(&self) -> Option<&RetryConfig> {
+        self.config.retry.as_ref()
+    }
+
     pub fn shared_variables(&self) -> &AgentVariables {
         &self.shared_variables
     }
@@ -312,10 +316,14 @@ impl Agent {
     }
 
     fn run_instructions_fn(&self) -> Result<String> {
-        let value = run_llm_function(
+        let retry_config = self.config.retry.clone()
+            .unwrap_or_else(RetryConfig::new_default);
+        let value = run_llm_function_with_retry(
             self.name().to_string(),
             vec!["_instructions".into(), "{}".into()],
             self.variable_envs(),
+            &retry_config,
+            &format!("{}-_instructions", self.name()),
         )?;
         match value {
             Some(v) => Ok(v),
@@ -382,6 +390,27 @@ pub struct AgentConfig {
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub variables: AgentVariables,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RetryConfig {
+    #[serde(default = "RetryConfig::default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "RetryConfig::default_delay_ms")]
+    pub delay_ms: u64,
+    #[serde(default = "RetryConfig::default_backoff_factor")]
+    pub backoff_factor: f64,
+}
+
+impl RetryConfig {
+    fn default_max_attempts() -> u32 { 3 }
+    fn default_delay_ms() -> u64 { 1000 }
+    fn default_backoff_factor() -> f64 { 2.0 }
+    pub fn new_default() -> Self {
+        Self { max_attempts: 3, delay_ms: 1000, backoff_factor: 2.0 }
+    }
 }
 
 impl AgentConfig {

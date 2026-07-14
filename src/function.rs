@@ -1,5 +1,5 @@
 use crate::{
-    config::{Agent, Config, GlobalConfig},
+    config::{Agent, Config, GlobalConfig, RetryConfig},
     utils::*,
 };
 
@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    time::Duration,
     sync::OnceLock,
     path::{Path, PathBuf},
 };
@@ -34,10 +35,18 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
     let results: Result<Vec<(ToolCall, Value)>> = calls
         .into_par_iter()
         .map(|call| {
-            let mut result = call.eval(config)?;
-            if result.is_null() {
-                result = json!("DONE");
-            }
+            let result = match call.eval(config) {
+                Ok(val) => {
+                    if val.is_null() {
+                        json!("DONE")
+                    } else {
+                        val
+                    }
+                }
+                Err(err) => {
+                    json!({"error": format!("{err:#}"), "tool_call": call.name.clone(), "status": "failed_after_retries"})
+                }
+            };
             Ok((call, result))
         })
         .collect();
@@ -228,7 +237,17 @@ impl ToolCall {
 
         cmd_args.push(json_data.to_string());
 
-        let output = match run_llm_function(cmd_name, cmd_args, envs)? {
+        // Resolve retry config: agent-level > global-level > hardcoded default
+        let retry_config = {
+            let cfg = config.read();
+            cfg.agent
+                .as_ref()
+                .and_then(|a| a.retry_config().cloned())
+                .or_else(|| cfg.tool_call_retry.clone())
+                .unwrap_or_else(RetryConfig::new_default)
+        };
+
+        let output = match run_llm_function_with_retry(cmd_name, cmd_args, envs, &retry_config, &call_name)? {
             Some(contents) => serde_json::from_str(&contents)
                 .ok()
                 .unwrap_or_else(|| json!({"output": contents})),
@@ -279,6 +298,49 @@ impl ToolCall {
             false => bail!("Unexpected call: {function_name} {}", self.arguments),
         }
     }
+}
+
+pub fn run_llm_function_with_retry(
+    cmd_name: String,
+    cmd_args: Vec<String>,
+    envs: HashMap<String, String>,
+    retry_config: &RetryConfig,
+    call_name: &str,
+) -> Result<Option<String>> {
+    let max = retry_config.max_attempts.max(1);
+    let mut last_err = None;
+
+    for attempt in 0..max {
+        match run_llm_function(cmd_name.clone(), cmd_args.clone(), envs.clone()) {
+            Ok(output) => return Ok(output),
+            Err(err) => {
+                let err_msg = format!("{err:#}");
+                last_err = Some(err);
+
+                if attempt + 1 < max {
+                    let delay_ms = (retry_config.delay_ms as f64
+                        * retry_config.backoff_factor.powi(attempt as i32))
+                        as u64;
+                    eprintln!(
+                        "\u{26a0}\u{fe0f}  Tool call '{}' failed (attempt {}/{}): {}. Retrying in {}ms...",
+                        call_name,
+                        attempt + 1,
+                        max,
+                        err_msg,
+                        delay_ms
+                    );
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                } else {
+                    eprintln!(
+                        "\u{274c} Tool call '{}' failed after {} attempts: {}",
+                        call_name, max, err_msg
+                    );
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap())
 }
 
 pub fn run_llm_function(
