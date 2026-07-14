@@ -670,6 +670,8 @@ pub fn is_retriable_error(err: &anyhow::Error) -> bool {
         || msg.contains("timed out")
         || msg.contains("quota_exceeded")
         || msg.contains("api_key_command exited")
+        // Empty/blank responses (any status) — matches tool call retry classification
+        || msg.contains("Empty response body")
 }
 
 pub fn catch_error(data: &Value, status: u16) -> Result<()> {

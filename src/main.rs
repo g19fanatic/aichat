@@ -202,7 +202,7 @@ async fn start_directive(
     let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if !input.stream() || extract_code {
+    let result = if !input.stream() || extract_code {
         call_chat_completions(
             &input,
             true,
@@ -210,10 +210,46 @@ async fn start_directive(
             client.as_ref(),
             abort_signal.clone(),
         )
-        .await?
+        .await
     } else {
-        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
+        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await
     };
+
+    let (output, tool_results) = match result {
+        Ok(v) => v,
+        Err(err) => {
+            // LLM-mediated error recovery: send the error to the LLM for graceful explanation
+            let error_msg = format!(
+                "[SYSTEM ERROR]\nThe API request failed: {}\n\n                 Please inform the user about this error gracefully and suggest they try again.",
+                err
+            );
+            let mut recovery_input = input.clone();
+            recovery_input.set_text(error_msg);
+            // One recovery attempt using the same model
+            let recovery_result = if !recovery_input.stream() || extract_code {
+                call_chat_completions(
+                    &recovery_input,
+                    true,
+                    extract_code,
+                    client.as_ref(),
+                    abort_signal.clone(),
+                )
+                .await
+            } else {
+                call_chat_completions_streaming(
+                    &recovery_input,
+                    client.as_ref(),
+                    abort_signal.clone(),
+                )
+                .await
+            };
+            match recovery_result {
+                Ok(v) => v,
+                Err(_) => return Err(err), // Recovery failed, return original error
+            }
+        }
+    };
+
     config
         .write()
         .after_chat_completion(&input, &output, &tool_results)?;

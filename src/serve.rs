@@ -433,6 +433,35 @@ impl Server {
                         }
 
                         let first = match last_err {
+                            Some(err) if !handler.has_output() => {
+                                // LLM-mediated error recovery for streaming path
+                                let error_msg = format!(
+                                    "[SYSTEM ERROR]\nThe API request failed: {:?}\n\nPlease inform the user about this error gracefully and suggest they try again.",
+                                    err
+                                );
+                                let recovery_data = ChatCompletionsData {
+                                    messages: vec![Message::new(
+                                        MessageRole::User,
+                                        MessageContent::Text(error_msg),
+                                    )],
+                                    temperature: data.temperature,
+                                    top_p: data.top_p,
+                                    functions: None,
+                                    stream: false,
+                                    cache_content_blocks: vec![],
+                                    cache_warm: false,
+                                };
+                                match client.chat_completions_inner(http_client, recovery_data).await {
+                                    Ok(output) => {
+                                        // Send recovered text as if it streamed
+                                        let _ = tx.send(ResEvent::First(None));
+                                        is_first.store(false, Ordering::SeqCst);
+                                        let _ = tx.send(ResEvent::Text(output.text));
+                                        None // No error to report
+                                    }
+                                    Err(_) => Some(format!("{err:?}")), // Recovery failed
+                                }
+                            }
                             Some(err) => Some(format!("{err:?}")),
                             None => None,
                         };
@@ -556,7 +585,29 @@ impl Server {
             }
 
             let output = match last_err {
-                Some(err) => return Err(err),
+                Some(err) => {
+                    // LLM-mediated error recovery: send error to model for graceful explanation
+                    let error_msg = format!(
+                        "[SYSTEM ERROR]\nThe API request failed: {}\n\nPlease inform the user about this error gracefully and suggest they try again.",
+                        err
+                    );
+                    let recovery_data = ChatCompletionsData {
+                        messages: vec![Message::new(
+                            MessageRole::User,
+                            MessageContent::Text(error_msg),
+                        )],
+                        temperature: data.temperature,
+                        top_p: data.top_p,
+                        functions: None,
+                        stream: false,
+                        cache_content_blocks: vec![],
+                        cache_warm: false,
+                    };
+                    match client.chat_completions_inner(&http_client, recovery_data).await {
+                        Ok(output) => output,
+                        Err(_) => return Err(err), // Recovery failed, return original error
+                    }
+                }
                 None => last_ok.expect("retry loop exited without output; this is a bug"),
             };
 
