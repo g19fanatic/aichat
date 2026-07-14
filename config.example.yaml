@@ -18,6 +18,20 @@ mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
 use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
 
+# ---- retry ----
+# Retry configuration for tool/function calls (rate limits, transient errors)
+# tool_call_retry:
+#   max_attempts: 3              # Maximum number of attempts (default: 3)
+#   delay_ms: 1000               # Initial delay between retries in milliseconds (default: 1000)
+#   backoff_factor: 2.0          # Exponential backoff multiplier (default: 2.0)
+
+# Retry configuration for LLM API calls (rate limits, blank responses, transient errors)
+# llm_call_retry:
+#   max_attempts: 4              # Maximum number of attempts (default: 4)
+#   delay_ms: 5000               # Initial delay between retries in milliseconds (default: 5000)
+#   backoff_factor: 2.0          # Exponential backoff multiplier (default: 2.0)
+# retry_blank_llm_response: false  # If true, retry when the LLM returns an empty response (default: false)
+
 # ---- prelude ----
 repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
 cmd_prelude: null                # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)

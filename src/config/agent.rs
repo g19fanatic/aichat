@@ -411,6 +411,13 @@ impl RetryConfig {
     pub fn new_default() -> Self {
         Self { max_attempts: 3, delay_ms: 1000, backoff_factor: 2.0 }
     }
+
+    /// Default retry config for LLM HTTP calls.
+    /// Uses max_attempts=4 to match the legacy `0..=3` loop (4 total attempts),
+    /// and a 5 000 ms base delay with 2× backoff (5 s / 10 s / 20 s).
+    pub fn new_llm_default() -> Self {
+        Self { max_attempts: 4, delay_ms: 5000, backoff_factor: 2.0 }
+    }
 }
 
 impl AgentConfig {

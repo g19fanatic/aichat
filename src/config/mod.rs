@@ -122,6 +122,12 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_retry: Option<agent::RetryConfig>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_call_retry: Option<agent::RetryConfig>,
+
+    #[serde(default)]
+    pub retry_blank_llm_response: bool,
+
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
     pub agent_prelude: Option<String>,
@@ -200,6 +206,9 @@ impl Default for Config {
             use_tools: None,
 
             tool_call_retry: None,
+
+            llm_call_retry: None,
+            retry_blank_llm_response: false,
 
             repl_prelude: None,
             cmd_prelude: None,

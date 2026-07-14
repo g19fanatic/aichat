@@ -22,12 +22,14 @@ use std::{
         Arc,
     },
 };
+use std::time::Duration;
 use tokio::{
     net::TcpListener,
     sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
+    time::sleep,
 };
 use tokio_graceful::Shutdown;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -378,12 +380,61 @@ impl Server {
                             }
                         };
                     } else {
-                        let ret = client
-                            .chat_completions_streaming_inner(http_client, handler, data)
-                            .await;
-                        let first = match ret {
-                            Ok(()) => None,
-                            Err(err) => Some(format!("{err:?}")),
+                        let retry_config = client
+                            .global_config()
+                            .read()
+                            .llm_call_retry
+                            .clone()
+                            .unwrap_or_else(RetryConfig::new_llm_default);
+                        let retry_blank = client.global_config().read().retry_blank_llm_response;
+                        let max = retry_config.max_attempts.max(1);
+                        let mut last_err: Option<anyhow::Error> = None;
+
+                        'retry: for attempt in 0..max {
+                            if attempt > 0 {
+                                if handler.has_output() {
+                                    break 'retry;
+                                }
+                                let delay_ms = (retry_config.delay_ms as f64
+                                    * retry_config.backoff_factor.powi(attempt as i32 - 1))
+                                    as u64;
+                                eprintln!(
+                                    "Warning: Retriable streaming error (attempt {}/{max}), retrying in {}ms...",
+                                    attempt,
+                                    delay_ms,
+                                );
+                                sleep(Duration::from_millis(delay_ms)).await;
+                            }
+                            match client
+                                .chat_completions_streaming_inner(http_client, handler, data.clone())
+                                .await
+                            {
+                                Ok(()) if retry_blank && !handler.has_output() && attempt + 1 < max => {
+                                    eprintln!(
+                                        "Warning: Empty streaming response (attempt {}/{max}), retrying...",
+                                        attempt + 1
+                                    );
+                                    last_err = None;
+                                    continue 'retry;
+                                }
+                                Ok(()) => {
+                                    last_err = None;
+                                    break 'retry;
+                                }
+                                Err(err) if is_retriable_error(&err) && !handler.has_output() => {
+                                    last_err = Some(err);
+                                    continue 'retry;
+                                }
+                                Err(err) => {
+                                    last_err = Some(err);
+                                    break 'retry;
+                                }
+                            }
+                        }
+
+                        let first = match last_err {
+                            Some(err) => Some(format!("{err:?}")),
+                            None => None,
                         };
                         if is_first.load(Ordering::SeqCst) {
                             let _ = tx.send(ResEvent::First(first));
@@ -453,7 +504,62 @@ impl Server {
                 .body(BodyExt::boxed(StreamBody::new(stream)))?;
             Ok(res)
         } else {
-            let output = client.chat_completions_inner(&http_client, data).await?;
+            let retry_config = config
+                .read()
+                .llm_call_retry
+                .clone()
+                .unwrap_or_else(RetryConfig::new_llm_default);
+            let retry_blank = config.read().retry_blank_llm_response;
+            let max = retry_config.max_attempts.max(1);
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut last_ok: Option<ChatCompletionsOutput> = None;
+
+            'retry: for attempt in 0..max {
+                if attempt > 0 {
+                    let delay_ms = (retry_config.delay_ms as f64
+                        * retry_config.backoff_factor.powi(attempt as i32 - 1))
+                        as u64;
+                    eprintln!(
+                        "Warning: Retriable error (attempt {}/{max}), retrying in {}ms...",
+                        attempt,
+                        delay_ms,
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+                match client.chat_completions_inner(&http_client, data.clone()).await {
+                    Ok(output)
+                        if output.text.is_empty()
+                            && output.tool_calls.is_empty()
+                            && retry_blank
+                            && attempt + 1 < max =>
+                    {
+                        eprintln!(
+                            "Warning: Empty LLM response (attempt {}/{max}), retrying...",
+                            attempt + 1
+                        );
+                        last_ok = Some(output);
+                        last_err = None;
+                        continue 'retry;
+                    }
+                    Ok(output) => {
+                        last_ok = Some(output);
+                        last_err = None;
+                        break 'retry;
+                    }
+                    Err(err) if is_retriable_error(&err) && attempt + 1 < max => {
+                        last_err = Some(err);
+                        last_ok = None;
+                        continue 'retry;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
+            let output = match last_err {
+                Some(err) => return Err(err),
+                None => last_ok.expect("retry loop exited without output; this is a bug"),
+            };
+
             let res = Response::builder()
                 .header("Content-Type", "application/json")
                 .body(

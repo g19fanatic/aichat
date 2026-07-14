@@ -72,30 +72,61 @@ pub trait Client: Sync + Send {
             return Ok(ChatCompletionsOutput::new(&content));
         }
         let client = self.build_client()?;
-        let max_retries = 3u32;
-        let mut last_err = None;
+        let retry_config = self
+            .global_config()
+            .read()
+            .llm_call_retry
+            .clone()
+            .unwrap_or_else(crate::config::RetryConfig::new_llm_default);
+        let max = retry_config.max_attempts.max(1);
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut last_ok: Option<ChatCompletionsOutput> = None;
 
-        for attempt in 0..=max_retries {
+        'retry: for attempt in 0..max {
             if attempt > 0 {
-                let backoff_secs = 5u64 * 2u64.pow(attempt - 1);
+                let delay_ms = (retry_config.delay_ms as f64
+                    * retry_config.backoff_factor.powi(attempt as i32 - 1))
+                    as u64;
                 eprintln!(
-                    "Warning: Retriable error (attempt {attempt}/{max_retries}), retrying in {backoff_secs}s..."
+                    "Warning: Retriable error (attempt {}/{max}), retrying in {}s...",
+                    attempt,
+                    delay_ms / 1000
                 );
-                sleep(Duration::from_secs(backoff_secs)).await;
+                sleep(Duration::from_millis(delay_ms)).await;
             }
             let data = input.prepare_completion_data(self.model(), false)?;
             match self.chat_completions_inner(&client, data).await {
+                Ok(output)
+                    if output.text.is_empty()
+                        && output.tool_calls.is_empty()
+                        && self.global_config().read().retry_blank_llm_response
+                        && attempt + 1 < max =>
+                {
+                    eprintln!(
+                        "Warning: Empty LLM response (attempt {}/{max}), retrying...",
+                        attempt + 1
+                    );
+                    last_ok = Some(output);
+                    last_err = None;
+                    continue 'retry;
+                }
                 Ok(output) => return Ok(output),
                 Err(err) if is_retriable_error(&err) => {
                     last_err = Some(err);
-                    continue;
+                    last_ok = None;
+                    continue 'retry;
                 }
                 Err(err) => return Err(err).with_context(|| "Failed to call chat-completions api"),
             }
         }
-        Err(last_err.unwrap()).with_context(|| {
-            format!("Failed to call chat-completions api (after {max_retries} retries)")
-        })
+        match last_err {
+            Some(err) => Err(err).with_context(|| {
+                format!("Failed to call chat-completions api (after {max} retries)")
+            }),
+            None => Ok(last_ok.expect(
+                "retry loop exited without producing an error or output; this is a bug",
+            )),
+        }
     }
 
     async fn chat_completions_streaming(
@@ -113,31 +144,56 @@ pub trait Client: Sync + Send {
                     return Ok(());
                 }
                 let client = self.build_client()?;
-                let max_retries = 3u32;
+                let retry_config = self
+                    .global_config()
+                    .read()
+                    .llm_call_retry
+                    .clone()
+                    .unwrap_or_else(crate::config::RetryConfig::new_llm_default);
+                let retry_blank = self.global_config().read().retry_blank_llm_response;
+                let max = retry_config.max_attempts.max(1);
                 let mut last_err = None;
 
-                for attempt in 0..=max_retries {
+                'retry: for attempt in 0..max {
                     if attempt > 0 {
                         if handler.has_output() {
-                            break;
+                            break 'retry;
                         }
-                        let backoff_secs = 5u64 * 2u64.pow(attempt - 1);
+                        let delay_ms = (retry_config.delay_ms as f64
+                            * retry_config.backoff_factor.powi(attempt as i32 - 1))
+                            as u64;
                         eprintln!(
-                            "Warning: Retriable error (attempt {attempt}/{max_retries}), retrying in {backoff_secs}s..."
+                            "Warning: Retriable error (attempt {}/{max}), retrying in {}s...",
+                            attempt,
+                            delay_ms / 1000
                         );
-                        sleep(Duration::from_secs(backoff_secs)).await;
+                        sleep(Duration::from_millis(delay_ms)).await;
                     }
                     let data = input.prepare_completion_data(self.model(), true)?;
                     match self.chat_completions_streaming_inner(&client, handler, data).await {
+                        Ok(()) if retry_blank && !handler.has_output() && attempt + 1 < max => {
+                            eprintln!(
+                                "Warning: Empty streaming response (attempt {}/{max}), retrying...",
+                                attempt + 1
+                            );
+                            let delay_ms = (retry_config.delay_ms as f64
+                                * retry_config.backoff_factor.powi(attempt as i32))
+                                as u64;
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            continue 'retry;
+                        }
                         Ok(()) => return Ok(()),
                         Err(err) if is_retriable_error(&err) && !handler.has_output() => {
                             last_err = Some(err);
-                            continue;
+                            continue 'retry;
                         }
                         Err(err) => return Err(err),
                     }
                 }
-                Err(last_err.unwrap())
+                match last_err {
+                    Some(err) => Err(err),
+                    None => Ok(()),
+                }
             } => {
                 handler.done();
                 ret.with_context(|| "Failed to call chat-completions api")
@@ -321,7 +377,7 @@ impl RequestData {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChatCompletionsData {
     pub messages: Vec<Message>,
     pub temperature: Option<f64>,
@@ -604,6 +660,16 @@ pub fn is_retriable_error(err: &anyhow::Error) -> bool {
         || msg.contains("status: 401")
         || msg.contains("authorization header required")
         || msg.contains("Failed to acquire API key")
+        // Rate limiting and service unavailability
+        || msg.contains("status: 429")
+        || msg.contains("status: 503")
+        || msg.contains("rate_limit")
+        // Transient network errors
+        || msg.contains("connection refused")
+        || msg.contains("connection reset")
+        || msg.contains("timed out")
+        || msg.contains("quota_exceeded")
+        || msg.contains("api_key_command exited")
 }
 
 pub fn catch_error(data: &Value, status: u16) -> Result<()> {
@@ -1266,5 +1332,47 @@ mod tests {
             is_retriable_error(&err),
             "Failed to acquire API key should be retriable"
         );
+    }
+
+    #[test]
+    fn test_is_retriable_error_429() {
+        let err = anyhow::anyhow!(
+            "Non-JSON response (status: 429 Too Many Requests, content-type: application/json): body"
+        );
+        assert!(is_retriable_error(&err), "429 Too Many Requests should be retriable");
+    }
+
+    #[test]
+    fn test_is_retriable_error_503() {
+        let err = anyhow::anyhow!(
+            "Non-JSON response (status: 503 Service Unavailable, content-type: text/html): <html>..."
+        );
+        assert!(is_retriable_error(&err), "503 Service Unavailable should be retriable");
+    }
+
+    #[test]
+    fn test_is_retriable_error_rate_limit() {
+        let err = anyhow::anyhow!(
+            "rate_limit exceeded: You have sent too many requests (type: rate_limit)"
+        );
+        assert!(is_retriable_error(&err), "rate_limit error should be retriable");
+    }
+
+    #[test]
+    fn test_is_retriable_error_connection_refused() {
+        let err = anyhow::anyhow!("connection refused (os error 111)");
+        assert!(is_retriable_error(&err), "connection refused should be retriable");
+    }
+
+    #[test]
+    fn test_is_retriable_error_connection_reset() {
+        let err = anyhow::anyhow!("connection reset by peer");
+        assert!(is_retriable_error(&err), "connection reset should be retriable");
+    }
+
+    #[test]
+    fn test_is_retriable_error_timed_out() {
+        let err = anyhow::anyhow!("request timed out after 30s");
+        assert!(is_retriable_error(&err), "timed out should be retriable");
     }
 }
