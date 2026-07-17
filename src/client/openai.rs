@@ -108,6 +108,7 @@ pub async fn openai_chat_completions_streaming(
     let mut function_name = String::new();
     let mut function_arguments = String::new();
     let mut function_id = String::new();
+    let mut function_extra_content: Option<Value> = None;
     let mut reasoning_state = 0;
     let handle = |message: SseMmessage| -> Result<bool> {
         if message.data == "[DONE]" {
@@ -122,7 +123,7 @@ pub async fn openai_chat_completions_streaming(
                     function_name.clone(),
                     arguments,
                     normalize_function_id(&function_id),
-                ))?;
+                ).with_extra_content(function_extra_content.take()))?;
             }
             return Ok(true);
         }
@@ -172,11 +173,12 @@ pub async fn openai_chat_completions_streaming(
                         function_name.clone(),
                         arguments,
                         normalize_function_id(&function_id),
-                    ))?;
+                    ).with_extra_content(function_extra_content.take()))?;
                 }
                 function_name.clear();
                 function_arguments.clear();
                 function_id.clear();
+                function_extra_content = None;
                 call_id = maybe_call_id;
             }
             if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
@@ -191,6 +193,9 @@ pub async fn openai_chat_completions_streaming(
             }
             if let Some(id) = id {
                 function_id = id.to_string();
+            }
+            if let Some(extra) = data["choices"][0]["delta"]["tool_calls"][0].get("extra_content") {
+                function_extra_content = Some(extra.clone());
             }
         }
         Ok(false)
@@ -252,14 +257,18 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                         let tool_calls: Vec<_> = tool_results
                             .iter()
                             .map(|tool_result| {
-                                json!({
+                                let mut tc = json!({
                                     "id": tool_result.call.id,
                                     "type": "function",
                                     "function": {
                                         "name": tool_result.call.name,
                                         "arguments": tool_result.call.arguments.to_string(),
                                     },
-                                })
+                                });
+                                if let Some(extra) = &tool_result.call.extra_content {
+                                    tc["extra_content"] = extra.clone();
+                                }
+                                tc
                             })
                             .collect();
                         let mut messages = vec![
@@ -275,19 +284,21 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                         messages
                     } else {
                         tool_results.into_iter().flat_map(|tool_result| {
+                            let mut tc = json!({
+                                "id": tool_result.call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_result.call.name,
+                                    "arguments": tool_result.call.arguments.to_string(),
+                                },
+                            });
+                            if let Some(extra) = &tool_result.call.extra_content {
+                                tc["extra_content"] = extra.clone();
+                            }
                             vec![
                                 json!({
                                     "role": MessageRole::Assistant,
-                                    "tool_calls": [
-                                        {
-                                            "id": tool_result.call.id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_result.call.name,
-                                                "arguments": tool_result.call.arguments.to_string(),
-                                            },
-                                        }
-                                    ]
+                                    "tool_calls": [tc]
                                 }),
                                 json!({
                                     "role": "tool",
@@ -430,7 +441,7 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
                     name.to_string(),
                     arguments,
                     Some(id.to_string()),
-                ));
+                ).with_extra_content(call.get("extra_content").cloned()));
             }
         }
     };

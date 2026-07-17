@@ -166,6 +166,8 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<Value>,
 }
 
 type CallConfig = (String, String, Vec<String>, HashMap<String, String>);
@@ -195,7 +197,13 @@ impl ToolCall {
             name,
             arguments,
             id,
+            extra_content: None,
         }
+    }
+
+    pub fn with_extra_content(mut self, extra_content: Option<Value>) -> Self {
+        self.extra_content = extra_content;
+        self
     }
 
     pub fn eval(&self, config: &GlobalConfig) -> Result<Value> {
