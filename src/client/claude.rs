@@ -16,6 +16,7 @@ pub struct ClaudeConfig {
     pub api_base: Option<String>,
     pub api_key_command: Option<String>,
     pub api_key_command_expires_in: Option<u64>,
+    pub use_bearer_auth: Option<bool>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -55,7 +56,11 @@ fn prepare_chat_completions(
     let mut request_data = RequestData::new(url, body);
 
     request_data.header("anthropic-version", "2023-06-01");
-    request_data.header("x-api-key", api_key);
+    if self_.config.use_bearer_auth.unwrap_or(false) {
+        request_data.bearer_auth(&api_key);
+    } else {
+        request_data.header("x-api-key", &api_key);
+    }
 
     // Enable 1-hour extended cache TTL for newer Claude models
     // Note: user patches can override this header to combine multiple beta features
@@ -542,4 +547,6 @@ fn claude_supports_extended_cache(model: &Model) -> bool {
         || name.contains("opus-4")
         || name.contains("sonnet-4")
         || name.contains("haiku-4")
+        || name.contains("sonnet-5")
+        || name.contains("opus-5")
 }
