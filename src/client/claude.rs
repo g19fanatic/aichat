@@ -338,6 +338,19 @@ pub fn claude_build_chat_completions_body(
         } else {
             json!({"type": "ephemeral"})
         };
+        // Track every message-level cache_control placement so we can enforce
+        // Anthropic's hard limit of at most 4 cache_control blocks per request.
+        // Each entry is (message_index, content_block_index, keep_priority) where a
+        // LOWER priority number means "keep first". The tools & system breakpoints
+        // are the stable 1h prefix and are ALWAYS kept (they are separate top-level
+        // fields, not part of `messages`), so they are not tracked here but they DO
+        // count toward the budget of 4.
+        //   priority 0 = last history-turn boundary   (highest keep)
+        //   priority 1 = the single kept content-block breakpoint
+        //   priority 2 = last-message breakpoint
+        //   priority 3 = intermediate stepping-stone  (dropped first)
+        //   priority 4 = extra content-block breakpoints beyond the first kept one
+        let mut cc_sites: Vec<(usize, usize, u8)> = Vec::new();
         // Add cache_control to last tool for tool-level caching. The tools block is
         // emitted FIRST, so it must carry a TTL >= the system block's TTL to keep
         // the tools -> system -> messages sequence non-increasing.
@@ -381,6 +394,22 @@ pub fn claude_build_chat_completions_body(
                         }
                         obj
                     }).collect();
+                    // Record the content-block breakpoints for the cap pass. Only the
+                    // LAST breakpoint is a preferred keeper (priority 1); any earlier
+                    // ones are "extra" content-block breakpoints (priority 4, dropped
+                    // first among content blocks) so we retain at most one.
+                    let breakpoint_block_indices: Vec<usize> = content_blocks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, b)| b.get("cache_control").is_some())
+                        .map(|(bi, _)| bi)
+                        .collect();
+                    if let Some(last_pos) = breakpoint_block_indices.len().checked_sub(1) {
+                        for (pos, &bi) in breakpoint_block_indices.iter().enumerate() {
+                            let priority = if pos == last_pos { 1u8 } else { 4u8 };
+                            cc_sites.push((last_user_idx, bi, priority));
+                        }
+                    }
                     body["messages"][last_user_idx]["content"] = json!(content_blocks);
                 }
             }
@@ -394,10 +423,14 @@ pub fn claude_build_chat_completions_body(
                     "text": content_str,
                     "cache_control": {"type": "ephemeral"}
                 }]);
+                // last-message breakpoint => keep priority 2
+                cc_sites.push((last_idx, 0, 2));
             } else if body["messages"][last_idx]["content"].is_array() {
                 let content_len = body["messages"][last_idx]["content"].as_array().map_or(0, |a| a.len());
                 if content_len > 0 {
                     body["messages"][last_idx]["content"][content_len - 1]["cache_control"] = json!({"type": "ephemeral"});
+                    // last-message breakpoint => keep priority 2
+                    cc_sites.push((last_idx, content_len - 1, 2));
                 }
             }
         }
@@ -424,6 +457,8 @@ pub fn claude_build_chat_completions_body(
                             "text": content_str,
                             "cache_control": {"type": "ephemeral"}
                         }]);
+                        // last history-turn boundary => highest keep priority 0
+                        cc_sites.push((last_asst_idx, 0, 0));
                     } else if body["messages"][last_asst_idx]["content"].is_array() {
                         let content_len = body["messages"][last_asst_idx]["content"]
                             .as_array()
@@ -431,6 +466,8 @@ pub fn claude_build_chat_completions_body(
                         if content_len > 0 {
                             body["messages"][last_asst_idx]["content"][content_len - 1]["cache_control"] =
                                 json!({"type": "ephemeral"});
+                            // last history-turn boundary => highest keep priority 0
+                            cc_sites.push((last_asst_idx, content_len - 1, 0));
                         }
                     }
                 }
@@ -466,6 +503,8 @@ pub fn claude_build_chat_completions_body(
                             "text": content_str,
                             "cache_control": {"type": "ephemeral"}
                         }]);
+                        // intermediate stepping-stone => lowest keep priority 3 (dropped first)
+                        cc_sites.push((target_idx, 0, 3));
                     } else if body["messages"][target_idx]["content"].is_array() {
                         let content_len = body["messages"][target_idx]["content"]
                             .as_array()
@@ -473,7 +512,67 @@ pub fn claude_build_chat_completions_body(
                         if content_len > 0 {
                             body["messages"][target_idx]["content"][content_len - 1]["cache_control"] =
                                 json!({"type": "ephemeral"});
+                            // intermediate stepping-stone => lowest keep priority 3 (dropped first)
+                            cc_sites.push((target_idx, content_len - 1, 3));
                         }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Enforce Anthropic's hard limit of at most 4 cache_control blocks per
+        // request. Exceeding this yields a 400 ("at most 4 blocks with
+        // cache_control may be provided"). We run a single deterministic capping
+        // pass over ALL placed breakpoints.
+        //
+        // The tools + system breakpoints form the stable 1h prefix and are ALWAYS
+        // kept (they are top-level fields, processed FIRST by Anthropic). They are
+        // not tracked in `cc_sites` but they DO count toward the budget of 4.
+        //
+        // The message-level breakpoints in `cc_sites` are all 5m and are processed
+        // AFTER the prefix, so keeping any subset of them can never place a longer
+        // TTL after a shorter one — the non-increasing-TTL invariant holds by
+        // construction. We keep the highest-priority message-level breakpoints
+        // (lowest priority number) up to the remaining budget, and STRIP
+        // cache_control from the rest.
+        {
+            const MAX_CACHE_BLOCKS: usize = 4;
+
+            // Count the 1h prefix breakpoints (tools last element + any system block).
+            let tools_has_cc = body
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .and_then(|a| a.last())
+                .map_or(false, |t| t.get("cache_control").is_some());
+            let system_has_cc = match body.get("system") {
+                Some(Value::Array(blocks)) => {
+                    blocks.iter().any(|b| b.get("cache_control").is_some())
+                }
+                Some(Value::Object(obj)) => obj.get("cache_control").is_some(),
+                _ => false,
+            };
+            let prefix_count = (tools_has_cc as usize) + (system_has_cc as usize);
+            let msg_budget = MAX_CACHE_BLOCKS.saturating_sub(prefix_count);
+
+            // Deduplicate by (msg_idx, block_idx), keeping the BEST (lowest) priority
+            // so a block targeted by multiple sites is counted once and kept if any
+            // site wants it.
+            let mut sites = cc_sites;
+            sites.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+            sites.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+            if sites.len() > msg_budget {
+                // Stable-sort by keep-priority (ascending = keep first). Ties retain
+                // the earlier processing order established above.
+                sites.sort_by_key(|&(_, _, prio)| prio);
+                // Everything beyond the budget gets its cache_control stripped.
+                for &(mi, bi, _) in sites.iter().skip(msg_budget) {
+                    if let Some(block) = body["messages"][mi]["content"]
+                        .get_mut(bi)
+                        .and_then(|b| b.as_object_mut())
+                    {
+                        block.remove("cache_control");
                     }
                 }
             }
@@ -725,6 +824,119 @@ mod cache_ttl_tests {
         for w in seq.windows(2) {
             assert!(w[0] >= w[1], "sequence must be non-increasing: {seq:?}");
         }
+    }
+
+    /// Count the TOTAL number of cache_control blocks emitted across the FIXED
+    /// Anthropic processing order (tools -> system -> messages). This is the
+    /// quantity Anthropic caps at 4.
+    fn count_cache_control_blocks(body: &Value) -> usize {
+        collect_ttl_sequence(body).len()
+    }
+
+    /// Build a worst-case body that (before the cap) would emit 5-6 cache_control
+    /// blocks: extended-cache model (tools=1h, system=1h), 2 content-block
+    /// breakpoints on the last user message, and a long multi-turn history
+    /// (>10 history messages) so the last-message, history-turn, AND stepping-stone
+    /// breakpoints all fire.
+    fn build_over_limit_shape(model_name: &str) -> Value {
+        let functions = vec![
+            FunctionDeclaration {
+                name: "aaa_first_tool".into(),
+                description: "first".into(),
+                parameters: empty_schema(),
+                agent: false,
+            },
+            FunctionDeclaration {
+                name: "recent_tool_calls".into(),
+                description: "last".into(),
+                parameters: empty_schema(),
+                agent: false,
+            },
+        ];
+        // A system message + a long alternating history so history_end > 10 and the
+        // stepping-stone breakpoint fires, followed by a final user turn.
+        let mut messages = vec![Message::new(
+            MessageRole::System,
+            MessageContent::Text("system prompt".into()),
+        )];
+        // 14 alternating user/assistant history messages => history region well
+        // beyond the >10 threshold used by the stepping-stone logic.
+        for i in 0..14 {
+            let role = if i % 2 == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            };
+            messages.push(Message::new(
+                role,
+                MessageContent::Text(format!("history message {i}")),
+            ));
+        }
+        // Final current user turn (this is the one split into content blocks).
+        messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("buffers + prompt".into()),
+        ));
+        let cache_content_blocks = vec![
+            CacheContentBlock {
+                field_name: "buffers".into(),
+                text: "buffer text".into(),
+                is_breakpoint: true,
+            },
+            CacheContentBlock {
+                field_name: "prompt".into(),
+                text: "prompt text".into(),
+                is_breakpoint: true,
+            },
+        ];
+        let data = ChatCompletionsData {
+            messages,
+            temperature: None,
+            top_p: None,
+            functions: Some(functions),
+            stream: false,
+            cache_content_blocks,
+            cache_warm: false,
+        };
+        let model = Model::new("claude", model_name);
+        claude_build_chat_completions_body(data, &model).unwrap()
+    }
+
+    #[test]
+    fn test_cache_control_blocks_capped_at_four() {
+        // This worst-case shape would emit 5-6 cache_control blocks on the
+        // pre-cap code (tools + system + 2 content-blocks + last-message +
+        // history-turn + stepping-stone). The cap pass must reduce the TOTAL
+        // to at most 4.
+        let body = build_over_limit_shape("claude-opus-4-6");
+        let count = count_cache_control_blocks(&body);
+        assert!(
+            count <= 4,
+            "cache_control blocks must be capped at 4, got {count} in body {body}"
+        );
+
+        // The stable 1h prefix (tools + system) must survive the cap.
+        let tools = body["tools"].as_array().unwrap();
+        assert!(
+            tools.last().unwrap().get("cache_control").is_some(),
+            "tools breakpoint (1h prefix) must be preserved after capping"
+        );
+        assert!(
+            body["system"][0].get("cache_control").is_some(),
+            "system breakpoint (1h prefix) must be preserved after capping"
+        );
+
+        // The surviving TTL sequence must still be non-increasing.
+        let seq = collect_ttl_sequence(&body);
+        for w in seq.windows(2) {
+            assert!(
+                w[0] >= w[1],
+                "capped TTL sequence must remain non-increasing, got {seq:?}"
+            );
+        }
+        // First two entries are the 1h prefix.
+        assert_eq!(seq.first().copied(), Some(3600), "first TTL must be 1h (tools)");
+        assert_eq!(seq.get(1).copied(), Some(3600), "second TTL must be 1h (system)");
     }
 }
 
