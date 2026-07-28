@@ -233,40 +233,69 @@ pub fn claude_build_chat_completions_body(
                     })]
                 }
                 MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
+                    tool_results, text, sequence,
                 }) => {
-                    let mut assistant_parts = vec![];
-                    let mut user_parts = vec![];
-                    if !text.is_empty() {
-                        assistant_parts.push(json!({
-                            "type": "text",
-                            "text": text,
-                        }))
+                    if !sequence {
+                        // Single round: all tool_uses in one assistant msg,
+                        // all tool_results in one user msg (parallel batch).
+                        let mut assistant_parts = vec![];
+                        let mut user_parts = vec![];
+                        if !text.is_empty() {
+                            assistant_parts.push(json!({
+                                "type": "text",
+                                "text": text,
+                            }))
+                        }
+                        for tool_result in tool_results {
+                            assistant_parts.push(json!({
+                                "type": "tool_use",
+                                "id": tool_result.call.id,
+                                "name": tool_result.call.name,
+                                "input": tool_result.call.arguments,
+                            }));
+                            user_parts.push(json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_result.call.id,
+                                "content": tool_result.output.to_string(),
+                            }));
+                        }
+                        vec![
+                            json!({
+                                "role": "assistant",
+                                "content": assistant_parts,
+                            }),
+                            json!({
+                                "role": "user",
+                                "content": user_parts,
+                            }),
+                        ]
+                    } else {
+                        // Sequential rounds: each tool_use/result gets its own
+                        // assistant+user message pair to preserve temporal ordering.
+                        tool_results.into_iter().flat_map(|tool_result| {
+                            vec![
+                                json!({
+                                    "role": "assistant",
+                                    "content": [json!({
+                                        "type": "tool_use",
+                                        "id": tool_result.call.id,
+                                        "name": tool_result.call.name,
+                                        "input": tool_result.call.arguments,
+                                    })],
+                                }),
+                                json!({
+                                    "role": "user",
+                                    "content": [json!({
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_result.call.id,
+                                        "content": tool_result.output.to_string(),
+                                    })],
+                                }),
+                            ]
+                        }).collect()
                     }
-                    for tool_result in tool_results {
-                        assistant_parts.push(json!({
-                            "type": "tool_use",
-                            "id": tool_result.call.id,
-                            "name": tool_result.call.name,
-                            "input": tool_result.call.arguments,
-                        }));
-                        user_parts.push(json!({
-                            "type": "tool_result",
-                            "tool_use_id": tool_result.call.id,
-                            "content": tool_result.output.to_string(),
-                        }));
-                    }
-                    vec![
-                        json!({
-                            "role": "assistant",
-                            "content": assistant_parts,
-                        }),
-                        json!({
-                            "role": "user",
-                            "content": user_parts,
-                        }),
-                    ]
                 }
+
             }
         })
         .collect();

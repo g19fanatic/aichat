@@ -176,15 +176,21 @@ impl ToolCall {
     pub fn dedup(calls: Vec<Self>) -> Vec<Self> {
         let mut new_calls = vec![];
         let mut seen_ids = HashSet::new();
+        let mut seen_signatures = HashSet::new();
 
         for call in calls.into_iter().rev() {
+            let sig = format!("{}:{}", call.name, call.arguments);
             if let Some(id) = &call.id {
                 if !seen_ids.contains(id) {
                     seen_ids.insert(id.clone());
-                    new_calls.push(call);
+                    if seen_signatures.insert(sig) {
+                        new_calls.push(call);
+                    }
                 }
             } else {
-                new_calls.push(call);
+                if seen_signatures.insert(sig) {
+                    new_calls.push(call);
+                }
             }
         }
 
