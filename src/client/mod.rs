@@ -12,6 +12,7 @@ pub use common::*;
 pub use message::*;
 pub use model::*;
 pub use self::api_key_command::resolve_api_key;
+pub use self::access_token::invalidate_access_token;
 pub use stream::*;
 
 register_client!(

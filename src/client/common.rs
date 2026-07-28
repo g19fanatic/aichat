@@ -112,6 +112,9 @@ pub trait Client: Sync + Send {
                 }
                 Ok(output) => return Ok(output),
                 Err(err) if is_retriable_error(&err) => {
+                    if is_auth_error(&err) {
+                        crate::client::invalidate_access_token(self.name());
+                    }
                     last_err = Some(err);
                     last_ok = None;
                     continue 'retry;
@@ -184,6 +187,9 @@ pub trait Client: Sync + Send {
                         }
                         Ok(()) => return Ok(()),
                         Err(err) if is_retriable_error(&err) && !handler.has_output() => {
+                            if is_auth_error(&err) {
+                                crate::client::invalidate_access_token(self.name());
+                            }
                             last_err = Some(err);
                             continue 'retry;
                         }
@@ -672,6 +678,14 @@ pub fn is_retriable_error(err: &anyhow::Error) -> bool {
         || msg.contains("api_key_command exited")
         // Empty/blank responses (any status) — matches tool call retry classification
         || msg.contains("Empty response body")
+}
+
+pub fn is_auth_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("status: 401")
+        || msg.contains("authorization header required")
+        || msg.contains("Failed to acquire API key")
+        || msg.contains("authentication is required")
 }
 
 pub fn catch_error(data: &Value, status: u16) -> Result<()> {
@@ -1376,5 +1390,25 @@ mod tests {
     fn test_is_retriable_error_timed_out() {
         let err = anyhow::anyhow!("request timed out after 30s");
         assert!(is_retriable_error(&err), "timed out should be retriable");
+    }
+    #[test]
+    fn test_is_auth_error() {
+        // Auth-class errors -> true
+        let e401 = anyhow::anyhow!(
+            "Non-JSON response (status: 401 Unauthorized, content-type: text/html): <html>"
+        );
+        assert!(is_auth_error(&e401), "401 should be an auth error");
+        let e_auth = anyhow::anyhow!("authentication is required");
+        assert!(is_auth_error(&e_auth), "'authentication is required' should be an auth error");
+
+        // Non-auth retriable errors -> false (must NOT force api_key_command re-run)
+        let e429 = anyhow::anyhow!(
+            "Non-JSON response (status: 429 Too Many Requests, content-type: application/json): body"
+        );
+        assert!(!is_auth_error(&e429), "429 should NOT be an auth error");
+        let e504 = anyhow::anyhow!(
+            "Non-JSON response (status: 504 Gateway Timeout, content-type: text/html): <html>"
+        );
+        assert!(!is_auth_error(&e504), "504 should NOT be an auth error");
     }
 }

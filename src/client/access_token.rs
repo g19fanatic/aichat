@@ -30,3 +30,28 @@ pub fn set_access_token(client_name: &str, token: String, expires_at: i64) {
     entry.0 = token;
     entry.1 = expires_at;
 }
+
+pub fn invalidate_access_token(client_name: &str) {
+    ACCESS_TOKENS.write().shift_remove(client_name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_invalidate_access_token() {
+        // Unique client name: ACCESS_TOKENS is process-global under parallel tests.
+        let c = "test_invalidate_client";
+        let expires_at = Utc::now().timestamp() + 3600;
+        set_access_token(c, "tok-abc".to_string(), expires_at);
+        assert!(is_valid_access_token(c), "token should be valid after set");
+
+        invalidate_access_token(c);
+        assert!(!is_valid_access_token(c), "token should be invalid after invalidate");
+        assert!(
+            get_access_token(c).is_err(),
+            "get_access_token should err after invalidate (entry removed)"
+        );
+    }
+}
