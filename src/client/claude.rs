@@ -324,19 +324,35 @@ pub fn claude_build_chat_completions_body(
         || body["messages"].as_array().map_or(false, |m| m.len() > 1)
         || body.get("tools").is_some();
     if should_cache {
-        // Add cache_control to last tool for tool-level caching
+        // Determine the TTL applied to the system block. Anthropic processes
+        // cache_control blocks in a FIXED order (tools -> system -> messages) and
+        // requires the TTLs across that sequence to be MONOTONICALLY NON-INCREASING:
+        // a longer TTL must NOT come after a shorter one. Because the tools
+        // breakpoint precedes the system breakpoint, if the system block carries
+        // ttl=1h then the tools breakpoint must ALSO carry ttl=1h (otherwise the
+        // 1h would illegally "come after" the tools default 5m block, yielding a
+        // 400 ValidationException). We propagate the longest TTL backward across
+        // the ordered block list so earlier blocks are >= all later blocks.
+        let system_cache_control = if claude_supports_extended_cache(model) {
+            json!({"type": "ephemeral", "ttl": "1h"})
+        } else {
+            json!({"type": "ephemeral"})
+        };
+        // Add cache_control to last tool for tool-level caching. The tools block is
+        // emitted FIRST, so it must carry a TTL >= the system block's TTL to keep
+        // the tools -> system -> messages sequence non-increasing.
         if let Some(tools_arr) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
             if let Some(last_tool) = tools_arr.last_mut() {
-                last_tool["cache_control"] = json!({"type": "ephemeral"});
+                // The tools breakpoint is processed BEFORE the system block, so it
+                // must carry a TTL >= the system block TTL. Stamp it with the same
+                // (propagated) TTL used for the system block to keep the ordered
+                // tools -> system -> messages TTL sequence monotonically non-increasing.
+                last_tool["cache_control"] = system_cache_control.clone();
             }
         }
         // Explicit block-level cache_control on system message for better cache granularity
         if let Some(system_str) = body.get("system").and_then(|v| v.as_str()).map(|s| s.to_string()) {
-            let cache_control = if claude_supports_extended_cache(model) {
-                json!({"type": "ephemeral", "ttl": "1h"})
-            } else {
-                json!({"type": "ephemeral"})
-            };
+            let cache_control = system_cache_control.clone();
             body["system"] = json!([{
                 "type": "text",
                 "text": system_str,
@@ -550,3 +566,165 @@ fn claude_supports_extended_cache(model: &Model) -> bool {
         || name.contains("sonnet-5")
         || name.contains("opus-5")
 }
+
+
+#[cfg(test)]
+mod cache_ttl_tests {
+    use super::*;
+    use crate::config::CacheContentBlock;
+    use crate::function::{FunctionDeclaration, JsonSchema};
+
+    fn empty_schema() -> JsonSchema {
+        JsonSchema {
+            type_value: Some("object".into()),
+            description: None,
+            properties: None,
+            items: None,
+            any_of: None,
+            enum_value: None,
+            default: None,
+            required: None,
+        }
+    }
+
+    /// Build a request body that reproduces the exact failing payload shape:
+    ///   - a system message (stamped ttl=1h for extended-cache models)
+    ///   - a tools array whose LAST tool receives a cache_control breakpoint
+    ///   - a user message split into content blocks with breakpoints (5m each)
+    ///   - an extra multi-turn message so the "last message" breakpoint (5m) fires
+    fn build_failing_shape(model_name: &str) -> Value {
+        let functions = vec![
+            FunctionDeclaration {
+                name: "aaa_first_tool".into(),
+                description: "first".into(),
+                parameters: empty_schema(),
+                agent: false,
+            },
+            FunctionDeclaration {
+                name: "recent_tool_calls".into(),
+                description: "last".into(),
+                parameters: empty_schema(),
+                agent: false,
+            },
+        ];
+        // Provide multi-turn messages so message-level breakpoints are emitted.
+        let messages = vec![
+            Message::new(MessageRole::System, MessageContent::Text("system prompt".into())),
+            Message::new(MessageRole::Assistant, MessageContent::Text("earlier reply".into())),
+            Message::new(MessageRole::User, MessageContent::Text("buffers + prompt".into())),
+        ];
+        let cache_content_blocks = vec![
+            CacheContentBlock { field_name: "buffers".into(), text: "buffer text".into(), is_breakpoint: true },
+            CacheContentBlock { field_name: "prompt".into(), text: "prompt text".into(), is_breakpoint: true },
+        ];
+        let data = ChatCompletionsData {
+            messages,
+            temperature: None,
+            top_p: None,
+            functions: Some(functions),
+            stream: false,
+            cache_content_blocks,
+            cache_warm: false,
+        };
+        let model = Model::new("claude", model_name);
+        claude_build_chat_completions_body(data, &model).unwrap()
+    }
+
+    /// Map an Anthropic cache_control value to a numeric TTL in seconds.
+    /// Missing/absent ttl defaults to the implicit 5-minute TTL (300s).
+    fn ttl_seconds(cache_control: &Value) -> u64 {
+        match cache_control.get("ttl").and_then(|v| v.as_str()) {
+            Some("1h") => 3600,
+            Some("5m") | None => 300,
+            Some(other) => panic!("unexpected ttl value: {other}"),
+        }
+    }
+
+    /// Collect the ordered list of cache_control TTLs across the FIXED Anthropic
+    /// processing order: tools -> system -> messages.
+    fn collect_ttl_sequence(body: &Value) -> Vec<u64> {
+        let mut seq = Vec::new();
+        // 1. tools (in array order; only breakpointed tools carry cache_control)
+        if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+            for tool in tools {
+                if let Some(cc) = tool.get("cache_control") {
+                    seq.push(ttl_seconds(cc));
+                }
+            }
+        }
+        // 2. system blocks
+        if let Some(system) = body.get("system").and_then(|s| s.as_array()) {
+            for block in system {
+                if let Some(cc) = block.get("cache_control") {
+                    seq.push(ttl_seconds(cc));
+                }
+            }
+        }
+        // 3. messages content blocks
+        if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+            for msg in messages {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                    for block in content {
+                        if let Some(cc) = block.get("cache_control") {
+                            seq.push(ttl_seconds(cc));
+                        }
+                    }
+                }
+            }
+        }
+        seq
+    }
+
+    #[test]
+    fn test_cache_control_ttl_sequence_is_non_increasing() {
+        // Extended-cache model => system stamped 1h. The tools breakpoint precedes
+        // the system block, so it must also be 1h to keep the sequence
+        // (tools -> system -> messages) monotonically non-increasing.
+        let body = build_failing_shape("claude-opus-4-6");
+        let seq = collect_ttl_sequence(&body);
+
+        assert!(
+            seq.len() >= 3,
+            "expected tools + system + message breakpoints, got sequence {seq:?} from body {body}"
+        );
+
+        // Core invariant: TTLs must be monotonically non-increasing across the
+        // fixed tools -> system -> messages order. This FAILS on the old code
+        // (tools defaulted to 5m while system was 1h => 300 then 3600 => increase).
+        for w in seq.windows(2) {
+            assert!(
+                w[0] >= w[1],
+                "cache_control TTL sequence must be non-increasing (tools->system->messages), got {seq:?}"
+            );
+        }
+
+        // Concrete assertion for the reconstructed failing payload: the tools
+        // breakpoint must now be 1h and the system block must remain 1h.
+        let tools = body["tools"].as_array().unwrap();
+        let last_tool_cc = tools.last().unwrap().get("cache_control").unwrap();
+        assert_eq!(ttl_seconds(last_tool_cc), 3600, "tools breakpoint must be stamped ttl=1h");
+
+        let system_cc = body["system"][0].get("cache_control").unwrap();
+        assert_eq!(ttl_seconds(system_cc), 3600, "system block must retain ttl=1h");
+
+        // And the first two entries of the sequence (tools, system) are the 1h prefix,
+        // with any later message breakpoints at 5m.
+        assert_eq!(seq[0], 3600, "first (tools) TTL must be 1h");
+        assert_eq!(seq[1], 3600, "second (system) TTL must be 1h");
+    }
+
+    #[test]
+    fn test_non_extended_model_uniform_5m_still_non_increasing() {
+        // Non-extended models never emit 1h; everything is implicit 5m, which is
+        // trivially non-increasing and must not regress.
+        let body = build_failing_shape("claude-3-haiku");
+        let seq = collect_ttl_sequence(&body);
+        for &t in &seq {
+            assert_eq!(t, 300, "non-extended model must only emit 5m TTLs, got {seq:?}");
+        }
+        for w in seq.windows(2) {
+            assert!(w[0] >= w[1], "sequence must be non-increasing: {seq:?}");
+        }
+    }
+}
+
