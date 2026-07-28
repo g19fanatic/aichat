@@ -579,7 +579,160 @@ pub fn claude_build_chat_completions_body(
         }
     }
 
+    ensure_tool_use_result_pairing(&mut body);
+
     Ok(body)
+}
+
+/// Enforce Anthropic's tool_use/tool_result adjacency invariant.
+///
+/// Every assistant `tool_use` block MUST be answered by a `tool_result`
+/// (matching `tool_use_id`, non-empty content) in the IMMEDIATELY-following
+/// user message. Interrupted turns can leave dangling/empty results, and
+/// conversation replay can leave orphan tool_results with no preceding
+/// tool_use, both of which cause a 400. This pass repairs the assembled body
+/// in place without reordering existing messages.
+fn ensure_tool_use_result_pairing(body: &mut Value) {
+    let msgs = match body.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m.clone(),
+        None => return,
+    };
+
+    let mut out: Vec<Value> = Vec::with_capacity(msgs.len() + 2);
+    let mut i = 0usize;
+    while i < msgs.len() {
+        let msg = &msgs[i];
+        let required_ids = if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            collect_tool_use_ids(msg)
+        } else {
+            Vec::new()
+        };
+
+        if required_ids.is_empty() {
+            // Non-assistant, or assistant with no tool_use.
+            // If it's a user message reached here, its preceding message was
+            // NOT an assistant-with-tool_use (that path consumes i+1 below),
+            // so any tool_result it carries is an orphan -> strip it.
+            let mut cleaned = msg.clone();
+            if cleaned.get("role").and_then(|r| r.as_str()) == Some("user") {
+                strip_all_tool_results(&mut cleaned);
+            }
+            out.push(cleaned);
+            i += 1;
+            continue;
+        }
+
+        // Assistant carries tool_use blocks: the next message must answer them.
+        out.push(msg.clone());
+        match msgs.get(i + 1) {
+            Some(next) if next.get("role").and_then(|r| r.as_str()) == Some("user") => {
+                let mut user = next.clone();
+                repair_user_message(&required_ids, &mut user);
+                out.push(user);
+                i += 2;
+            }
+            _ => {
+                // No following user message: synthesize one.
+                let results: Vec<Value> =
+                    required_ids.iter().map(|id| synth_tool_result(id)).collect();
+                out.push(json!({ "role": "user", "content": results }));
+                i += 1; // do NOT consume msgs[i+1]; it is unrelated.
+            }
+        }
+    }
+
+    if let Some(m) = body.get_mut("messages") {
+        *m = Value::Array(out);
+    }
+}
+
+/// Ordered list of `tool_use` ids in an assistant message's content.
+fn collect_tool_use_ids(msg: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                if let Some(id) = b.get("id").and_then(|v| v.as_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// True if a tool_result's `content` is missing/empty/hollow.
+fn is_hollow_content(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.trim().is_empty(),
+        Some(Value::Array(a)) => a.is_empty(),
+        Some(Value::Object(o)) => o.is_empty(),
+        _ => false,
+    }
+}
+
+fn synth_tool_result(id: &str) -> Value {
+    json!({
+        "type": "tool_result",
+        "tool_use_id": id,
+        "content": "[interrupted: no result captured]",
+        "is_error": true,
+    })
+}
+
+/// Ensure `user` answers every required id; drop orphan tool_results.
+/// Non-tool_result blocks (e.g. text) are preserved in place.
+fn repair_user_message(required_ids: &[String], user: &mut Value) {
+    if user.get("content").and_then(|c| c.as_array()).is_none() {
+        // No content array: replace with synthesized results wholesale.
+        let results: Vec<Value> =
+            required_ids.iter().map(|id| synth_tool_result(id)).collect();
+        user["content"] = Value::Array(results);
+        return;
+    }
+    let content = user
+        .get_mut("content")
+        .and_then(|c| c.as_array_mut())
+        .expect("content array checked above");
+
+    // 1. Drop orphan tool_results (tool_use_id not in required set).
+    content.retain(|b| {
+        if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+            match b.get("tool_use_id").and_then(|v| v.as_str()) {
+                Some(tid) => required_ids.iter().any(|r| r == tid),
+                None => false, // malformed tool_result -> drop
+            }
+        } else {
+            true // preserve text and other block types
+        }
+    });
+
+    // 2. Repair or synthesize each required id, in order.
+    for id in required_ids {
+        let pos = content.iter().position(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                && b.get("tool_use_id").and_then(|v| v.as_str()) == Some(id.as_str())
+        });
+        match pos {
+            Some(idx) => {
+                let existing = content[idx].get("content");
+                if is_hollow_content(existing) {
+                    content[idx]["content"] =
+                        Value::String("[interrupted: no result captured]".to_string());
+                    content[idx]["is_error"] = Value::Bool(true);
+                }
+            }
+            None => content.push(synth_tool_result(id)),
+        }
+    }
+}
+
+/// Remove all tool_result blocks from a user message (orphans w/ no preceding tool_use).
+fn strip_all_tool_results(msg: &mut Value) {
+    if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+        content.retain(|b| b.get("type").and_then(|t| t.as_str()) != Some("tool_result"));
+    }
 }
 
 pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
@@ -937,6 +1090,79 @@ mod cache_ttl_tests {
         // First two entries are the 1h prefix.
         assert_eq!(seq.first().copied(), Some(3600), "first TTL must be 1h (tools)");
         assert_eq!(seq.get(1).copied(), Some(3600), "second TTL must be 1h (system)");
+    }
+
+    #[test]
+    fn test_valid_pairing_unchanged() {
+        let mut body = json!({ "messages": [
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t1", "name": "n", "input": {} } ] },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "content": "ok" } ] },
+        ] });
+        let before = body.clone();
+        ensure_tool_use_result_pairing(&mut body);
+        assert_eq!(body, before, "valid body must pass through unchanged");
+    }
+
+    #[test]
+    fn test_dangling_tool_use_gets_synthesized_result() {
+        let mut body = json!({ "messages": [
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t1", "name": "n", "input": {} } ] },
+            { "role": "user", "content": [ { "type": "text", "text": "hi" } ] },
+        ] });
+        ensure_tool_use_result_pairing(&mut body);
+        let user = &body["messages"][1]["content"];
+        let tr = user
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == json!("tool_result") && b["tool_use_id"] == json!("t1"))
+            .expect("synthesized tool_result for t1 must exist");
+        assert_eq!(tr["is_error"], json!(true));
+        assert!(!tr["content"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_empty_tool_result_treated_as_missing() {
+        let mut body = json!({ "messages": [
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t1", "name": "n", "input": {} } ] },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "content": "" } ] },
+        ] });
+        ensure_tool_use_result_pairing(&mut body);
+        let tr = &body["messages"][1]["content"][0];
+        assert_eq!(tr["is_error"], json!(true));
+        assert!(!tr["content"].as_str().unwrap().trim().is_empty());
+    }
+
+    #[test]
+    fn test_dangling_tool_use_no_following_user_appends_user() {
+        let mut body = json!({ "messages": [
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t1", "name": "n", "input": {} } ] },
+        ] });
+        ensure_tool_use_result_pairing(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "a user message must be synthesized");
+        assert_eq!(msgs[1]["role"], json!("user"));
+        assert_eq!(msgs[1]["content"][0]["tool_use_id"], json!("t1"));
+        assert_eq!(msgs[1]["content"][0]["is_error"], json!(true));
+    }
+
+    #[test]
+    fn test_orphan_tool_result_dropped() {
+        let mut body = json!({ "messages": [
+            { "role": "user", "content": [
+                { "type": "text", "text": "hi" },
+                { "type": "tool_result", "tool_use_id": "ghost", "content": "x" } ] },
+        ] });
+        ensure_tool_use_result_pairing(&mut body);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "orphan tool_result must be dropped");
+        assert_eq!(content[0]["type"], json!("text"));
     }
 }
 
