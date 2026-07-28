@@ -726,6 +726,21 @@ fn repair_user_message(required_ids: &[String], user: &mut Value) {
             None => content.push(synth_tool_result(id)),
         }
     }
+
+    // 3. Anthropic requires tool_result block(s) to LEAD the user message that
+    //    answers a tool_use. Stable-partition the content vector: all
+    //    tool_result blocks first (preserving relative order), all other
+    //    blocks after (preserving relative order). Vec::sort_by_key is a
+    //    stable sort, so within-group ordering is retained. This corrects
+    //    turns where cache_content_blocks splitting overwrote the tool_result
+    //    turn with leading text blocks and step 2 re-appended a synth result.
+    content.sort_by_key(|b| {
+        if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+            0u8
+        } else {
+            1u8
+        }
+    });
 }
 
 /// Remove all tool_result blocks from a user message (orphans w/ no preceding tool_use).
@@ -1163,6 +1178,81 @@ mod cache_ttl_tests {
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1, "orphan tool_result must be dropped");
         assert_eq!(content[0]["type"], json!("text"));
+    }
+
+    #[test]
+    fn test_tool_result_leads_after_repair() {
+        // VIM-PATH regression: cache_content_blocks splitting OVERWROTE the
+        // tool_result turn with [text buffers, text active_buffer, text prompt],
+        // discarding the result. Pairing must synthesize the missing result AND
+        // hoist it to the FRONT (Anthropic: tool_result must LEAD the user
+        // message answering a tool_use). Pre-fix (no step-3 stable-partition)
+        // this FAILS: the synth result is appended to the end, leaving a text
+        // block at index 0.
+        let mut body = json!({ "messages": [
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t1", "name": "n", "input": {} } ] },
+            { "role": "user", "content": [
+                { "type": "text", "text": "buffers" },
+                { "type": "text", "text": "active_buffer" },
+                { "type": "text", "text": "prompt" } ] },
+        ] });
+        ensure_tool_use_result_pairing(&mut body);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0]["type"],
+            json!("tool_result"),
+            "tool_result must lead the answering user message"
+        );
+        assert_eq!(content[0]["tool_use_id"], json!("t1"));
+        assert_eq!(content[0]["is_error"], json!(true));
+        assert_eq!(
+            content[0]["content"],
+            json!("[interrupted: no result captured]"),
+            "synthesized result content must match synth_tool_result"
+        );
+        // The three text blocks follow, in original order.
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[1]["text"], json!("buffers"));
+        assert_eq!(content[2]["text"], json!("active_buffer"));
+        assert_eq!(content[3]["text"], json!("prompt"));
+    }
+
+    #[test]
+    fn test_existing_tool_result_hoisted_to_front() {
+        // A valid (non-hollow) tool_result sits between text blocks; repair must
+        // HOIST it to the front WITHOUT duplicating or re-synthesizing it, and
+        // without altering its content. Pre-fix (no step-3) this FAILS: it stays
+        // at index 1.
+        let mut body = json!({ "messages": [
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t1", "name": "n", "input": {} } ] },
+            { "role": "user", "content": [
+                { "type": "text", "text": "A" },
+                { "type": "tool_result", "tool_use_id": "t1", "content": "ok" },
+                { "type": "text", "text": "B" } ] },
+        ] });
+        ensure_tool_use_result_pairing(&mut body);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], json!("tool_result"));
+        assert_eq!(content[0]["tool_use_id"], json!("t1"));
+        let tr_count = content
+            .iter()
+            .filter(|b| b["type"] == json!("tool_result"))
+            .count();
+        assert_eq!(tr_count, 1, "existing tool_result must not be duplicated");
+        assert_eq!(
+            content[0]["content"],
+            json!("ok"),
+            "original result content must be preserved"
+        );
+        assert!(
+            content[0].get("is_error").is_none(),
+            "non-hollow existing result must not be marked is_error"
+        );
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[1]["text"], json!("A"));
+        assert_eq!(content[2]["text"], json!("B"));
     }
 }
 
