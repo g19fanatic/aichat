@@ -284,6 +284,9 @@ impl Input {
             }
             None => self.tool_calls = Some(MessageContentToolCalls::new(tool_results, output)),
         }
+        // Clear stale cache blocks: they are only meaningful for the first API call.
+        // On recursive tool-result submissions, they would overwrite tool_result messages.
+        self.cache_content_blocks = vec![];
         self
     }
 

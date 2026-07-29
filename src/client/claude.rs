@@ -413,6 +413,16 @@ pub fn claude_build_chat_completions_body(
                 if let Some(last_user_idx) = (0..msgs_len).rev()
                     .find(|&i| messages_arr[i]["role"] == "user")
                 {
+                    // Defense-in-depth: never overwrite a user message that contains
+                    // tool_result blocks — those are recursive tool-call turns where
+                    // cache_content_blocks are stale and would destroy the real result.
+                    let has_tool_results = messages_arr[last_user_idx]["content"]
+                        .as_array()
+                        .map(|arr| arr.iter().any(|b| b["type"] == "tool_result"))
+                        .unwrap_or(false);
+                    if has_tool_results {
+                        // Skip cache injection for tool-result turns
+                    } else {
                     let content_blocks: Vec<Value> = cache_content_blocks.iter().map(|block| {
                         let mut obj = json!({
                             "type": "text",
@@ -440,6 +450,7 @@ pub fn claude_build_chat_completions_body(
                         }
                     }
                     body["messages"][last_user_idx]["content"] = json!(content_blocks);
+                    } // else (has_tool_results guard)
                 }
             }
         }
@@ -1282,6 +1293,33 @@ mod cache_ttl_tests {
         assert_eq!(content.len(), 3);
         assert_eq!(content[1]["text"], json!("A"));
         assert_eq!(content[2]["text"], json!("B"));
+    }
+
+    #[test]
+    fn test_tool_result_survives_when_cache_blocks_cleared() {
+        // After the input.rs fix: merge_tool_results() clears cache_content_blocks,
+        // so the recursive tool-call turn arrives with an empty vec. The tool_result
+        // message must survive intact without being overwritten or synthesized.
+        let mut body = json!({ "messages": [
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t1", "name": "execute_tool_code", "input": {} } ] },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "content": "real tool output here" } ] },
+        ] });
+        ensure_tool_use_result_pairing(&mut body);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "tool_result should be the sole content block");
+        assert_eq!(content[0]["type"], json!("tool_result"));
+        assert_eq!(content[0]["tool_use_id"], json!("t1"));
+        assert_eq!(
+            content[0]["content"],
+            json!("real tool output here"),
+            "real tool output must be preserved, not replaced with synthetic interrupted message"
+        );
+        assert!(
+            content[0].get("is_error").is_none(),
+            "real result must NOT be marked as error"
+        );
     }
 }
 
