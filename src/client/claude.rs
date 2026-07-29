@@ -429,7 +429,7 @@ pub fn claude_build_chat_completions_body(
                             "text": block.text,
                         });
                         if block.is_breakpoint {
-                            obj["cache_control"] = json!({"type": "ephemeral"});
+                            obj["cache_control"] = system_cache_control.clone();
                         }
                         obj
                     }).collect();
@@ -461,14 +461,14 @@ pub fn claude_build_chat_completions_body(
                 body["messages"][last_idx]["content"] = json!([{
                     "type": "text",
                     "text": content_str,
-                    "cache_control": {"type": "ephemeral"}
+                    "cache_control": system_cache_control.clone()
                 }]);
                 // last-message breakpoint => keep priority 2
                 cc_sites.push((last_idx, 0, 2));
             } else if body["messages"][last_idx]["content"].is_array() {
                 let content_len = body["messages"][last_idx]["content"].as_array().map_or(0, |a| a.len());
                 if content_len > 0 {
-                    body["messages"][last_idx]["content"][content_len - 1]["cache_control"] = json!({"type": "ephemeral"});
+                    body["messages"][last_idx]["content"][content_len - 1]["cache_control"] = system_cache_control.clone();
                     // last-message breakpoint => keep priority 2
                     cc_sites.push((last_idx, content_len - 1, 2));
                 }
@@ -495,7 +495,7 @@ pub fn claude_build_chat_completions_body(
                         body["messages"][last_asst_idx]["content"] = json!([{
                             "type": "text",
                             "text": content_str,
-                            "cache_control": {"type": "ephemeral"}
+                            "cache_control": system_cache_control.clone()
                         }]);
                         // last history-turn boundary => highest keep priority 0
                         cc_sites.push((last_asst_idx, 0, 0));
@@ -505,7 +505,7 @@ pub fn claude_build_chat_completions_body(
                             .map_or(0, |a| a.len());
                         if content_len > 0 {
                             body["messages"][last_asst_idx]["content"][content_len - 1]["cache_control"] =
-                                json!({"type": "ephemeral"});
+                                system_cache_control.clone();
                             // last history-turn boundary => highest keep priority 0
                             cc_sites.push((last_asst_idx, content_len - 1, 0));
                         }
@@ -541,7 +541,7 @@ pub fn claude_build_chat_completions_body(
                         body["messages"][target_idx]["content"] = json!([{
                             "type": "text",
                             "text": content_str,
-                            "cache_control": {"type": "ephemeral"}
+                            "cache_control": system_cache_control.clone()
                         }]);
                         // intermediate stepping-stone => lowest keep priority 3 (dropped first)
                         cc_sites.push((target_idx, 0, 3));
@@ -551,7 +551,7 @@ pub fn claude_build_chat_completions_body(
                             .map_or(0, |a| a.len());
                         if content_len > 0 {
                             body["messages"][target_idx]["content"][content_len - 1]["cache_control"] =
-                                json!({"type": "ephemeral"});
+                                system_cache_control.clone();
                             // intermediate stepping-stone => lowest keep priority 3 (dropped first)
                             cc_sites.push((target_idx, content_len - 1, 3));
                         }
