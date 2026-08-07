@@ -38,7 +38,7 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
             let result = match call.eval(config) {
                 Ok(val) => {
                     if val.is_null() {
-                        json!("DONE")
+                        json!("Tool returned no response.")
                     } else {
                         val
                     }
@@ -51,15 +51,10 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
         })
         .collect();
     let results = results?;
-    let is_all_null = results.iter().all(|(_, r)| *r == json!("DONE"));
-    if is_all_null {
-        Ok(vec![])
-    } else {
-        Ok(results
-            .into_iter()
-            .map(|(call, result)| ToolResult::new(call, result))
-            .collect())
-    }
+    Ok(results
+        .into_iter()
+        .map(|(call, result)| ToolResult::new(call, result))
+        .collect())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
