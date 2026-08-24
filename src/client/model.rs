@@ -190,6 +190,10 @@ impl Model {
         self.data.no_stream
     }
 
+    pub fn use_responses_api(&self) -> bool {
+        self.data.use_responses_api
+    }
+
     pub fn no_system_message(&self) -> bool {
         self.data.no_system_message
     }
@@ -319,6 +323,8 @@ pub struct ModelData {
     pub supports_vision: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_function_calling: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_responses_api: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     no_stream: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -818,7 +818,7 @@ fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> 
 
 /// Build a request body for the OpenAI Responses API format.
 /// Converts ChatCompletionsData messages into the "input" field expected by /v1/responses.
-fn build_responses_api_body(data: ChatCompletionsData, model: &Model) -> Value {
+pub(crate) fn build_responses_api_body(data: ChatCompletionsData, model: &Model) -> Value {
     let ChatCompletionsData {
         messages,
         temperature,
@@ -935,7 +935,7 @@ fn build_responses_api_body(data: ChatCompletionsData, model: &Model) -> Value {
 
 /// Handle non-streaming Responses API response.
 /// Extracts text from the response output array.
-async fn responses_api_chat_completions(
+pub(crate) async fn responses_api_chat_completions(
     builder: RequestBuilder,
     _model: &Model,
 ) -> Result<ChatCompletionsOutput> {
@@ -1010,7 +1010,7 @@ async fn responses_api_chat_completions(
 
 /// Handle streaming Responses API response.
 /// Parses SSE events for text deltas from `response.output_text.delta` events.
-async fn responses_api_streaming(
+pub(crate) async fn responses_api_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
     _model: &Model,

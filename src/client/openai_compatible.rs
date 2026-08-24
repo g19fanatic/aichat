@@ -1,3 +1,4 @@
+use super::bedrock::{build_responses_api_body, responses_api_chat_completions, responses_api_streaming};
 use super::openai::*;
 use super::*;
 
@@ -30,8 +31,8 @@ impl_client_trait!(
     OpenAICompatibleClient,
     (
         prepare_chat_completions,
-        openai_chat_completions,
-        openai_chat_completions_streaming
+        openai_compatible_chat_completions,
+        openai_compatible_chat_completions_streaming
     ),
     (prepare_embeddings, openai_embeddings),
     (prepare_rerank, generic_rerank),
@@ -51,9 +52,15 @@ fn prepare_chat_completions(
     }
     let api_base = get_api_base_ext(self_)?;
 
-    let url = format!("{api_base}/chat/completions");
-
-    let body = openai_build_chat_completions_body(data, &self_.model);
+    let (url, body) = if self_.model.use_responses_api() {
+        let url = format!("{api_base}/responses");
+        let body = build_responses_api_body(data, &self_.model);
+        (url, body)
+    } else {
+        let url = format!("{api_base}/chat/completions");
+        let body = openai_build_chat_completions_body(data, &self_.model);
+        (url, body)
+    };
 
     let mut request_data = RequestData::new(url, body);
 
@@ -138,6 +145,29 @@ fn get_api_base_ext(self_: &OpenAICompatibleClient) -> Result<String> {
         }
     };
     Ok(api_base.trim_end_matches('/').to_string())
+}
+
+pub async fn openai_compatible_chat_completions(
+    builder: RequestBuilder,
+    model: &Model,
+) -> Result<ChatCompletionsOutput> {
+    if model.use_responses_api() {
+        responses_api_chat_completions(builder, model).await
+    } else {
+        openai_chat_completions(builder, model).await
+    }
+}
+
+pub async fn openai_compatible_chat_completions_streaming(
+    builder: RequestBuilder,
+    handler: &mut SseHandler,
+    model: &Model,
+) -> Result<()> {
+    if model.use_responses_api() {
+        responses_api_streaming(builder, handler, model).await
+    } else {
+        openai_chat_completions_streaming(builder, handler, model).await
+    }
 }
 
 pub async fn generic_rerank(builder: RequestBuilder, _model: &Model) -> Result<RerankOutput> {
