@@ -560,7 +560,7 @@ impl Session {
 impl RoleLike for Session {
     fn to_role(&self) -> Role {
         let role_name = self.role_name.as_deref().unwrap_or_default();
-        let mut role = Role::new(role_name, &self.role_prompt);
+        let mut role = Role::from_prompt(role_name, &self.role_prompt);
         role.sync(self);
         role
     }

@@ -20,8 +20,9 @@ pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
 #[folder = "assets/roles/"]
 struct RolesAsset;
 
-static RE_METADATA: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
+static RE_METADATA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)\A\s*-{3,}[ \t]*\r?\n(.*?)\r?\n-{3,}[ \t]*(?:\r?\n|\z)(.*)").unwrap()
+});
 
 pub trait RoleLike {
     fn to_role(&self) -> Role;
@@ -58,12 +59,17 @@ pub struct Role {
 
 impl Role {
     pub fn new(name: &str, content: &str) -> Self {
-        let mut metadata = "";
         let mut prompt = content.trim();
+        let mut metadata_map = None;
         if let Ok(Some(caps)) = RE_METADATA.captures(content) {
             if let (Some(metadata_value), Some(prompt_value)) = (caps.get(1), caps.get(2)) {
-                metadata = metadata_value.as_str().trim();
-                prompt = prompt_value.as_str().trim();
+                let candidate = metadata_value.as_str().trim();
+                if candidate.is_empty() {
+                    prompt = prompt_value.as_str().trim();
+                } else if let Ok(Value::Object(map)) = serde_yaml::from_str::<Value>(candidate) {
+                    metadata_map = Some(map);
+                    prompt = prompt_value.as_str().trim();
+                }
             }
         }
         let mut prompt = prompt.to_string();
@@ -73,22 +79,26 @@ impl Role {
             prompt,
             ..Default::default()
         };
-        if !metadata.is_empty() {
-            if let Ok(value) = serde_yaml::from_str::<Value>(metadata) {
-                if let Some(value) = value.as_object() {
-                    for (key, value) in value {
-                        match key.as_str() {
-                            "model" => role.model_id = value.as_str().map(|v| v.to_string()),
-                            "temperature" => role.temperature = value.as_f64(),
-                            "top_p" => role.top_p = value.as_f64(),
-                            "use_tools" => role.use_tools = value.as_str().map(|v| v.to_string()),
-                            _ => (),
-                        }
-                    }
+        if let Some(value) = metadata_map {
+            for (key, value) in &value {
+                match key.as_str() {
+                    "model" => role.model_id = value.as_str().map(|v| v.to_string()),
+                    "temperature" => role.temperature = value.as_f64(),
+                    "top_p" => role.top_p = value.as_f64(),
+                    "use_tools" => role.use_tools = value.as_str().map(|v| v.to_string()),
+                    _ => (),
                 }
             }
         }
         role
+    }
+
+    pub fn from_prompt(name: &str, prompt: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            prompt: prompt.trim().to_string(),
+            ..Default::default()
+        }
     }
 
     pub fn builtin(name: &str) -> Result<Self> {
@@ -389,5 +399,35 @@ System message
 Input 1
 "#;
         assert_eq!(parse_structure_prompt(prompt), (prompt, vec![]));
+    }
+
+    #[test]
+    fn test_role_new_preserves_markdown_tables_and_session_to_role_roundtrip() {
+        let raw = r#"---
+use_tools: all
+---
+# Intelligent Coding Assistant
+
+## Memory Backend Dispatch
+
+| Failure | Action |
+|---|---|
+| Empty tool cache | Use discovery when needed. |
+"#;
+        let role = Role::new("default-vim-role", raw);
+        assert_eq!(role.use_tools().as_deref(), Some("all"));
+        assert!(role.prompt().starts_with("# Intelligent Coding Assistant"));
+        assert!(role.prompt().contains("## Memory Backend Dispatch"));
+        assert!(role.prompt().contains("|---|---|"));
+
+        let second_pass = Role::new("default-vim-role", role.prompt());
+        assert_eq!(second_pass.prompt(), role.prompt());
+
+        let from_prompt = Role::from_prompt("default-vim-role", role.prompt());
+        assert_eq!(from_prompt.prompt(), role.prompt());
+
+        let empty_body = Role::new("%functions%", "---\nuse_tools: all\n---\n");
+        assert_eq!(empty_body.use_tools().as_deref(), Some("all"));
+        assert_eq!(empty_body.prompt(), "");
     }
 }
