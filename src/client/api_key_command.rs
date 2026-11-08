@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
+use serde_json::Value;
 use std::process::Command;
 
 use super::access_token::{get_access_token, is_valid_access_token, set_access_token};
@@ -7,6 +9,22 @@ use crate::utils::SHELL;
 
 /// Default expiry duration in seconds (1 hour) if not specified.
 const DEFAULT_EXPIRES_IN: i64 = 3600;
+/// Safety margin (seconds) subtracted from a JWT's `exp` claim when caching.
+const JWT_EXP_SKEW_SECS: i64 = 60;
+
+/// If `token` is a JWT with a numeric `exp` claim, return `exp - JWT_EXP_SKEW_SECS`.
+pub(crate) fn extract_jwt_expires_at(token: &str) -> Option<i64> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let _sig = parts.next()?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload_b64.trim_end_matches('='))
+        .ok()?;
+    let json: Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = json.get("exp")?.as_i64()?;
+    Some(exp - JWT_EXP_SKEW_SECS)
+}
 
 /// Execute an api_key_command via the system shell and return the trimmed stdout.
 fn run_api_key_command(cmd: &str) -> Result<String> {
@@ -90,9 +108,15 @@ pub fn resolve_api_key(
         }
     };
 
-    // 5. Cache with expiry
-    let expires_in_secs = expires_in.map(|v| v as i64).unwrap_or(DEFAULT_EXPIRES_IN);
-    let expires_at = Utc::now().timestamp() + expires_in_secs;
+    // 5. Cache with expiry: honor JWT `exp` (with skew) so pre-aged tokens never
+    // outlive their real lifetime in memory; cap by explicit `expires_in` if given.
+    let now = Utc::now().timestamp();
+    let fallback_expires_at = now + expires_in.map(|v| v as i64).unwrap_or(DEFAULT_EXPIRES_IN);
+    let expires_at = match extract_jwt_expires_at(&token) {
+        Some(jwt_exp) if expires_in.is_some() => jwt_exp.min(fallback_expires_at),
+        Some(jwt_exp) => jwt_exp,
+        None => fallback_expires_at,
+    };
     set_access_token(client_name, token.clone(), expires_at);
 
     // 6. Return token

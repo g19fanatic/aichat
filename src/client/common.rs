@@ -686,6 +686,7 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
         || msg.contains("authorization header required")
         || msg.contains("Failed to acquire API key")
         || msg.contains("authentication is required")
+        || msg.contains("bearer token expired")
 }
 
 pub fn catch_error(data: &Value, status: u16) -> Result<()> {

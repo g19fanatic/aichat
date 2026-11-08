@@ -129,15 +129,14 @@ pub async fn openai_chat_completions_streaming(
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
-        if let Some(text) = data["choices"][0]["delta"]["content"]
-            .as_str()
+        if let Some(text) = extract_message_content_text(&data["choices"][0]["delta"]["content"])
             .filter(|v| !v.is_empty())
         {
             if reasoning_state == 1 {
                 handler.text("\n</think>\n\n")?;
                 reasoning_state = 0;
             }
-            handler.text(text)?;
+            handler.text(&text)?;
         } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
             .as_str()
             .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
@@ -415,9 +414,28 @@ pub fn openai_build_embeddings_body(data: &EmbeddingsData, model: &Model) -> Val
     })
 }
 
+/// Extract text from OpenAI/Bifrost `message.content` or `delta.content`,
+/// supporting both a plain string and an array of `{"type": "text", "text": "..."}` blocks.
+pub fn extract_message_content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(s) = part.as_str() {
+                    out.push_str(s);
+                } else if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
+                    out.push_str(s);
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
-    let text = data["choices"][0]["message"]["content"]
-        .as_str()
+    let text = extract_message_content_text(&data["choices"][0]["message"]["content"])
         .unwrap_or_default();
 
     let reasoning = data["choices"][0]["message"]["reasoning_content"]
@@ -464,7 +482,7 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     let text = if !reasoning.is_empty() {
         format!("<think>\n{reasoning}\n</think>\n\n{text}")
     } else {
-        text.to_string()
+        text
     };
     let output = ChatCompletionsOutput {
         text,
@@ -482,5 +500,34 @@ fn normalize_function_id(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_message_content_text_string_and_array() {
+        let s_data = json!({
+            "id": "1",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "hello world"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let out_s = openai_extract_chat_completions(&s_data).unwrap();
+        assert_eq!(out_s.text, "hello world");
+
+        let arr_data = json!({
+            "id": "2",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "part one
+"},
+                {"type": "text", "text": "part two"}
+            ]}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let out_arr = openai_extract_chat_completions(&arr_data).unwrap();
+        assert_eq!(out_arr.text, "part one
+part two");
     }
 }

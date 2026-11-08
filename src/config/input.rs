@@ -129,6 +129,11 @@ impl Input {
             .any(|(_, _, contents)| detect_cache_warm_field(contents))
             || std::env::var("AICHAT_CACHE_WARM").ok().as_deref() == Some("1");
         for (kind, path, contents) in documents {
+            let contents = if !vim_history_turns.is_empty() {
+                strip_extracted_json_fields(&contents)
+            } else {
+                contents
+            };
             if documents_len == 1 && raw_text.is_empty() {
                 texts.push(format!("\n{contents}"));
             } else {
@@ -556,6 +561,26 @@ fn truncate_turn_content(content: &str) -> String {
         dropped,
         &content[tail_start..]
     )
+}
+
+/// Remove `llm_history_turns` and `_cache_hints` from the raw JSON document text
+/// once `vim_history_turns` has already been extracted into multi-turn messages.
+/// Prevents sending 100KB+ of duplicate history turns in the final user message
+/// for OpenAI/Bifrost clients that do not use `cache_content_blocks`.
+pub fn strip_extracted_json_fields(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return content.to_string();
+    }
+    let mut json: Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return content.to_string(),
+    };
+    if let Some(obj) = json.as_object_mut() {
+        obj.remove("llm_history_turns");
+        obj.remove("_cache_hints");
+    }
+    serde_json::to_string(&json).unwrap_or_else(|_| content.to_string())
 }
 
 /// Parse `_cache_hints` from JSON content and split field values into content blocks.
